@@ -72,7 +72,9 @@ The agent core is a set of **decoupled modules behind clean interfaces**, so any
 
 ## Relationship to koretex
 
-[koretex](https://github.com/koretex-ai) is our network for running LLMs locally on Apple Silicon. It deliberately serves **text/code** models. This project's **vision grounder** runs in a sibling local runtime, while the **text planner** is exactly the kind of workload koretex is built for. The two are complementary: vision stays local to the agent; text can ride the network. Both run the same pinned Ollama engine, so they converge cleanly.
+[koretex](https://github.com/koretex-ai) is our network for running models locally on Apple Silicon. It serves text/code models — and now **vision-language models too**, over the same OpenAI-compatible `/v1/chat/completions` endpoint (a VLM streams text like any chat model; it's simply kept out of the throughput-based hardware ranking, since image prefill distorts tokens/sec).
+
+That makes **both halves of this agent first-class koretex workloads**: the **text planner** and the **vision grounder** can each run locally on your own machine *or* ride the koretex network. In practice the grounder benefits from running close to the browser loop for latency, but nothing in the architecture forces it to stay local. Agent and node share the same pinned Ollama engine, so they converge cleanly.
 
 ## Proof it works (Phase 0)
 
