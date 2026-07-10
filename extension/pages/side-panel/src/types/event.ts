@@ -19,6 +19,9 @@ export enum ExecutionState {
   TASK_OK = 'task.ok',
   TASK_FAIL = 'task.fail',
   TASK_CANCEL = 'task.cancel',
+
+  // Agent-loop step progress
+  STEP_OK = 'step.ok',
 }
 
 export interface EventData {

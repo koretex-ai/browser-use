@@ -86,6 +86,15 @@ const SidePanel = () => {
           setIsHistoricalSession(false);
           setStreamingText('');
           break;
+        case ExecutionState.STEP_OK:
+          // Agent-loop progress: narrate the step, keep the task running
+          appendMessage({
+            actor: Actors.SYSTEM,
+            content,
+            timestamp,
+          });
+          setStreamingText('');
+          break;
         case ExecutionState.TASK_OK:
           finishTask();
           setIsFollowUpMode(true);
@@ -288,6 +297,9 @@ const SidePanel = () => {
     }
 
     try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tabId = tabs[0]?.id;
+
       setInputEnabled(false);
       setShowStopButton(true);
 
@@ -321,6 +333,7 @@ const SidePanel = () => {
         type: isFollowUpMode ? 'follow_up_task' : 'new_task',
         task: text,
         taskId: sessionIdRef.current,
+        tabId,
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
