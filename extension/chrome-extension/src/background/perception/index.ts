@@ -34,7 +34,14 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   return `data:${blob.type};base64,${btoa(binary)}`;
 }
 
-async function downscaleDataUrl(dataUrl: string): Promise<string> {
+export interface Screenshot {
+  dataUrl: string;
+  /** Image dimensions in pixels (after downscaling) */
+  width: number;
+  height: number;
+}
+
+async function downscaleDataUrl(dataUrl: string): Promise<Screenshot> {
   const source = await createImageBitmap(await (await fetch(dataUrl)).blob());
   const scale = Math.min(1, MAX_SCREENSHOT_WIDTH / source.width);
   const width = Math.round(source.width * scale);
@@ -47,10 +54,10 @@ async function downscaleDataUrl(dataUrl: string): Promise<string> {
   source.close();
 
   const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: SCREENSHOT_JPEG_QUALITY });
-  return blobToDataUrl(blob);
+  return { dataUrl: await blobToDataUrl(blob), width, height };
 }
 
-export async function captureScreenshot(tabId: number): Promise<string> {
+export async function captureScreenshot(tabId: number): Promise<Screenshot> {
   const tab = await chrome.tabs.get(tabId);
   const raw = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 85 });
   return downscaleDataUrl(raw);
@@ -70,7 +77,7 @@ export async function capturePageState(tabId: number, showHighlights: boolean): 
     title: dom.title,
     scroll: dom.scroll,
     elements: dom.elements,
-    screenshot,
+    screenshot: screenshot.dataUrl,
     capturedAt: Date.now(),
   };
 }

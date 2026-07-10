@@ -12,7 +12,7 @@ You will receive:
 - PAGE: the current URL, title, scroll position, and a numbered list of interactive elements
 
 Choose exactly one action per turn:
-- click: click element by index (e.g. links, buttons)
+- click: click element by index (e.g. links, buttons). If the element you need is clearly on the page but MISSING from the PAGE list (icon-only button, canvas UI), omit "index" and set "target" to a short visual description instead — a vision model will locate it on a screenshot.
 - type: type text into an input element by index (this replaces its content)
 - scroll: scroll the page up or down to reveal more elements
 - navigate: go directly to a URL (fastest way to reach a known site)
@@ -21,7 +21,7 @@ Choose exactly one action per turn:
 - respond: the task needs no browser action at all (pure conversation) — leave message empty, a chat reply is generated separately
 
 Reply ONLY with a JSON object of this exact shape (omit fields that do not apply):
-{"reasoning": "<one short sentence>", "action": "click|type|scroll|navigate|back|done|respond", "index": <element index for click/type>, "text": "<text for type>", "url": "<url for navigate>", "direction": "up|down for scroll", "message": "<final answer for done>"}
+{"reasoning": "<one short sentence>", "action": "click|type|scroll|navigate|back|done|respond", "index": <element index for click/type>, "target": "<visual description, ONLY for click when the element is not in the PAGE list>", "text": "<text for type>", "url": "<url for navigate>", "direction": "up|down for scroll", "message": "<final answer for done>"}
 
 Rules:
 - Only use element indices that appear in the PAGE list.

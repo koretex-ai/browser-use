@@ -8,6 +8,8 @@ export interface PlannerDecision {
   reasoning: string;
   action: 'click' | 'type' | 'scroll' | 'navigate' | 'back' | 'done' | 'respond';
   index?: number;
+  /** Visual description for the grounder when the element is not in the PAGE list */
+  target?: string;
   text?: string;
   url?: string;
   direction?: 'up' | 'down';
@@ -78,11 +80,15 @@ export async function validateCompletion(systemPrompt: string, turn: string, sig
 }
 
 // Convert a planner decision into a typed executor action.
-// Returns null for respond/done, which the loop handles itself.
+// Returns null for respond/done (loop handles those) and for click-by-target
+// (loop routes it through the vision grounder first).
 export function decisionToAction(decision: PlannerDecision): Action | { error: string } | null {
   switch (decision.action) {
     case 'click':
-      if (decision.index === undefined) return { error: 'click requires an element index' };
+      if (decision.index === undefined) {
+        if (decision.target) return null; // grounder path
+        return { error: 'click requires an element index or a target description' };
+      }
       return { type: 'click', index: decision.index };
     case 'type':
       if (decision.index === undefined || !decision.text) return { error: 'type requires an index and text' };

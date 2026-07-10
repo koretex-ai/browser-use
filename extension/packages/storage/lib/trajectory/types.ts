@@ -7,6 +7,10 @@
  */
 export type Action =
   | { type: 'click'; index: number }
+  // Pixel click in viewport CSS coordinates, produced by the vision grounder.
+  // `target` is the natural-language instruction the grounder localized —
+  // (screenshot, target, x, y) tuples are grounder training data.
+  | { type: 'click_at'; x: number; y: number; target?: string }
   | { type: 'type'; index: number; text: string }
   | { type: 'scroll'; direction: 'up' | 'down'; amount?: number }
   | { type: 'navigate'; url: string }

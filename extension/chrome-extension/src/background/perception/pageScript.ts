@@ -173,6 +173,22 @@ export function typeIntoElement(index: number, text: string): { ok: boolean; err
   return { ok: false, error: `Element at index ${index} is not editable (<${el.tagName.toLowerCase()}>)` };
 }
 
+// Click at a point in viewport CSS coordinates (vision-grounded click)
+export function clickAtPoint(x: number, y: number): { ok: boolean; error?: string } {
+  const el = document.elementFromPoint(x, y) as HTMLElement | null;
+  if (!el) return { ok: false, error: `Nothing at (${x}, ${y})` };
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+    el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+  }
+  el.click?.();
+  return { ok: true };
+}
+
+// Report viewport CSS size (for scaling grounder image coordinates)
+export function getViewportSize(): { width: number; height: number } {
+  return { width: window.innerWidth, height: window.innerHeight };
+}
+
 // Scroll the page by roughly one viewport
 export function scrollPage(direction: 'up' | 'down', amount?: number): { ok: boolean } {
   const dy = (amount ?? Math.round(window.innerHeight * 0.75)) * (direction === 'down' ? 1 : -1);

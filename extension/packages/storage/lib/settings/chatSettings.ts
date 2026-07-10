@@ -2,10 +2,13 @@ import { StorageEnum } from '../base/enums';
 import { createStorage } from '../base/base';
 import type { BaseStorage } from '../base/types';
 
-// Settings for the local chat model served by Ollama
+// Settings for the local models served by Ollama
 export interface ChatSettingsConfig {
   baseUrl: string;
+  /** Planner/chat model (text) */
   model: string;
+  /** Vision grounder model (screenshot -> click coordinates) */
+  grounderModel: string;
 }
 
 export type ChatSettingsStorage = BaseStorage<ChatSettingsConfig> & {
@@ -17,6 +20,7 @@ export type ChatSettingsStorage = BaseStorage<ChatSettingsConfig> & {
 export const DEFAULT_CHAT_SETTINGS: ChatSettingsConfig = {
   baseUrl: 'http://localhost:11434',
   model: 'qwen3.5:4b',
+  grounderModel: 'hf.co/mradermacher/Holo1.5-3B-GGUF:Q4_K_M',
 };
 
 const storage = createStorage<ChatSettingsConfig>('chat-settings', DEFAULT_CHAT_SETTINGS, {

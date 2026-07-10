@@ -1,6 +1,7 @@
 import { trajectoryStore } from '@extension/storage';
 import { capturePageState, captureScreenshot, clearHighlights } from './perception';
 import { executeAction } from './actions/executor';
+import { groundTarget } from './agent/grounder';
 
 export interface CommandResult {
   text: string;
@@ -17,6 +18,7 @@ const HELP = [
   '/scroll up|down — scroll the page',
   '/nav <url> — navigate the tab',
   '/back — go back in history',
+  '/ground <description> — locate an element visually (Holo) and click it',
   '/nohighlight — remove element highlights',
   '/trajectory — show logged trajectory step count',
   '/help — this message',
@@ -46,8 +48,8 @@ export async function handleCommand(command: string, tabId: number, sessionId: s
     }
 
     case '/screenshot': {
-      const image = await captureScreenshot(tabId);
-      return { text: 'Screenshot of the visible tab:', image };
+      const shot = await captureScreenshot(tabId);
+      return { text: `Screenshot of the visible tab (${shot.width}×${shot.height}):`, image: shot.dataUrl };
     }
 
     case '/click': {
@@ -80,6 +82,20 @@ export async function handleCommand(command: string, tabId: number, sessionId: s
     case '/back': {
       const result = await executeAction(tabId, sessionId, { type: 'back' });
       return { text: result.message };
+    }
+
+    case '/ground': {
+      const description = rest.join(' ');
+      if (!description) return { text: 'Usage: /ground <visual description of the element>' };
+      await clearHighlights(tabId).catch(() => {});
+      const point = await groundTarget(tabId, description, new AbortController().signal);
+      const result = await executeAction(tabId, sessionId, {
+        type: 'click_at',
+        x: point.x,
+        y: point.y,
+        target: description,
+      });
+      return { text: `Grounded "${description}" at (${point.x}, ${point.y}) — ${result.message}` };
     }
 
     case '/nohighlight':

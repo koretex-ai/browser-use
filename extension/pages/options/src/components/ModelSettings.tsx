@@ -14,6 +14,7 @@ type ConnectionStatus =
 export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_CHAT_SETTINGS.baseUrl);
   const [model, setModel] = useState(DEFAULT_CHAT_SETTINGS.model);
+  const [grounderModel, setGrounderModel] = useState(DEFAULT_CHAT_SETTINGS.grounderModel);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [connection, setConnection] = useState<ConnectionStatus>({ state: 'idle' });
   const [saved, setSaved] = useState(false);
@@ -22,6 +23,7 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
     chatSettingsStore.getSettings().then(settings => {
       setBaseUrl(settings.baseUrl);
       setModel(settings.model);
+      setGrounderModel(settings.grounderModel);
     });
   }, []);
 
@@ -46,7 +48,7 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
   }, [testConnection]);
 
   const handleSave = async () => {
-    await chatSettingsStore.updateSettings({ baseUrl: baseUrl.replace(/\/$/, ''), model });
+    await chatSettingsStore.updateSettings({ baseUrl: baseUrl.replace(/\/$/, ''), model, grounderModel });
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -119,6 +121,40 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
             className={inputClass}
           />
         )}
+      </div>
+
+      <div>
+        <label htmlFor="grounder-model" className={labelClass}>
+          Vision grounder model
+        </label>
+        {availableModels.length > 0 ? (
+          <select
+            id="grounder-model"
+            value={grounderModel}
+            onChange={e => setGrounderModel(e.target.value)}
+            className={inputClass}>
+            {!availableModels.includes(grounderModel) && (
+              <option value={grounderModel}>{grounderModel} (not installed)</option>
+            )}
+            {availableModels.map(name => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            id="grounder-model"
+            type="text"
+            value={grounderModel}
+            onChange={e => setGrounderModel(e.target.value)}
+            placeholder={DEFAULT_CHAT_SETTINGS.grounderModel}
+            className={inputClass}
+          />
+        )}
+        <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+          Locates elements on screenshots when they are missing from the DOM (used as a fallback).
+        </p>
       </div>
 
       <div className="flex items-center gap-3">

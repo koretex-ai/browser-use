@@ -2,7 +2,7 @@ import type { Action, PerceptionSnapshot } from '@extension/storage';
 import { trajectoryStore } from '@extension/storage';
 import { createLogger } from '../log';
 import { capturePageState, runInPage } from '../perception';
-import { clickElementByIndex, typeIntoElement, scrollPage } from '../perception/pageScript';
+import { clickElementByIndex, clickAtPoint, typeIntoElement, scrollPage } from '../perception/pageScript';
 
 const logger = createLogger('executor');
 
@@ -34,6 +34,13 @@ async function performAction(tabId: number, action: Action): Promise<ActionResul
       await sleep(POST_ACTION_DELAY_MS);
       await waitForTabLoad(tabId);
       return { ok: true, message: `Clicked element [${action.index}]` };
+    }
+    case 'click_at': {
+      const result = await runInPage(tabId, clickAtPoint, action.x, action.y);
+      if (!result?.ok) return { ok: false, message: result?.error ?? 'Click failed' };
+      await sleep(POST_ACTION_DELAY_MS);
+      await waitForTabLoad(tabId);
+      return { ok: true, message: `Clicked at (${action.x}, ${action.y})${action.target ? ` — "${action.target}"` : ''}` };
     }
     case 'type': {
       const result = await runInPage(tabId, typeIntoElement, action.index, action.text);

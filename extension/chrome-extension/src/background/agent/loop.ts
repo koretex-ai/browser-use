@@ -5,6 +5,7 @@ import { postExecutionEvent } from '../events';
 import { capturePageState, clearHighlights } from '../perception';
 import { executeAction } from '../actions/executor';
 import { streamChatReply } from './chat';
+import { groundTarget } from './grounder';
 import { planNextAction, validateCompletion, decisionToAction } from './planner';
 import {
   PLANNER_SYSTEM_PROMPT,
@@ -98,6 +99,37 @@ export async function runAgentTask(
         await clearHighlights(tabId).catch(() => {});
         postExecutionEvent(port, Actors.ASSISTANT, 'task.ok', taskId, answer);
         return;
+      }
+
+      // Hybrid grounding: click-by-target routes through the vision grounder
+      if (decision.action === 'click' && decision.index === undefined && decision.target) {
+        postExecutionEvent(
+          port,
+          Actors.SYSTEM,
+          'step.ok',
+          taskId,
+          `Step ${step}: locating "${decision.target}" visually — ${decision.reasoning}`,
+        );
+        // Highlights would pollute the grounder's screenshot
+        await clearHighlights(tabId).catch(() => {});
+        try {
+          const point = await groundTarget(tabId, decision.target, signal);
+          const result = await executeAction(tabId, taskId, {
+            type: 'click_at',
+            x: point.x,
+            y: point.y,
+            target: point.target,
+          });
+          history.push(`ground+click "${decision.target}" -> ${result.ok ? 'ok' : `FAILED: ${result.message}`}`);
+          consecutiveFailures = result.ok ? 0 : consecutiveFailures + 1;
+        } catch (error) {
+          if (signal.aborted) throw error;
+          const message = error instanceof Error ? error.message : String(error);
+          history.push(`ground "${decision.target}" -> FAILED: ${message}`);
+          consecutiveFailures++;
+        }
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) break;
+        continue;
       }
 
       const action = decisionToAction(decision);
