@@ -1,0 +1,135 @@
+import { useState, useEffect, useCallback } from 'react';
+import { chatSettingsStore, DEFAULT_CHAT_SETTINGS } from '@extension/storage';
+
+interface ModelSettingsProps {
+  isDarkMode?: boolean;
+}
+
+type ConnectionStatus =
+  | { state: 'idle' }
+  | { state: 'testing' }
+  | { state: 'ok'; models: string[] }
+  | { state: 'error'; message: string };
+
+export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_CHAT_SETTINGS.baseUrl);
+  const [model, setModel] = useState(DEFAULT_CHAT_SETTINGS.model);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [connection, setConnection] = useState<ConnectionStatus>({ state: 'idle' });
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    chatSettingsStore.getSettings().then(settings => {
+      setBaseUrl(settings.baseUrl);
+      setModel(settings.model);
+    });
+  }, []);
+
+  const testConnection = useCallback(async (url: string) => {
+    setConnection({ state: 'testing' });
+    try {
+      const response = await fetch(`${url}/api/tags`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      const models: string[] = (data.models ?? []).map((m: { name: string }) => m.name);
+      setAvailableModels(models);
+      setConnection({ state: 'ok', models });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setConnection({ state: 'error', message: `Cannot reach Ollama at ${url} (${message})` });
+    }
+  }, []);
+
+  // Probe Ollama once on mount with the stored URL
+  useEffect(() => {
+    chatSettingsStore.getSettings().then(settings => testConnection(settings.baseUrl));
+  }, [testConnection]);
+
+  const handleSave = async () => {
+    await chatSettingsStore.updateSettings({ baseUrl: baseUrl.replace(/\/$/, ''), model });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const inputClass = `w-full rounded-md border p-2 text-sm ${
+    isDarkMode ? 'border-slate-600 bg-slate-700 text-gray-200' : 'border-gray-300 bg-white text-gray-800'
+  }`;
+  const labelClass = `mb-1 block text-sm font-medium ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`;
+
+  return (
+    <section className="space-y-6">
+      <div>
+        <h2 className={`mb-1 text-lg font-semibold ${isDarkMode ? 'text-gray-200' : 'text-gray-800'}`}>Local model</h2>
+        <p className={`text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+          The chat runs entirely on your machine through Ollama. Nothing leaves your computer.
+        </p>
+      </div>
+
+      <div>
+        <label htmlFor="ollama-url" className={labelClass}>
+          Ollama URL
+        </label>
+        <div className="flex gap-2">
+          <input
+            id="ollama-url"
+            type="text"
+            value={baseUrl}
+            onChange={e => setBaseUrl(e.target.value)}
+            placeholder={DEFAULT_CHAT_SETTINGS.baseUrl}
+            className={inputClass}
+          />
+          <button
+            type="button"
+            onClick={() => testConnection(baseUrl.replace(/\/$/, ''))}
+            className="shrink-0 rounded-md bg-sky-500 px-3 py-1 text-sm text-white transition-colors hover:bg-sky-600">
+            Test
+          </button>
+        </div>
+        {connection.state === 'testing' && (
+          <p className={`mt-1 text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Connecting…</p>
+        )}
+        {connection.state === 'ok' && (
+          <p className="mt-1 text-sm text-green-600">
+            Connected — {connection.models.length} model{connection.models.length === 1 ? '' : 's'} available
+          </p>
+        )}
+        {connection.state === 'error' && <p className="mt-1 text-sm text-red-500">{connection.message}</p>}
+      </div>
+
+      <div>
+        <label htmlFor="chat-model" className={labelClass}>
+          Chat model
+        </label>
+        {availableModels.length > 0 ? (
+          <select id="chat-model" value={model} onChange={e => setModel(e.target.value)} className={inputClass}>
+            {!availableModels.includes(model) && <option value={model}>{model} (not installed)</option>}
+            {availableModels.map(name => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            id="chat-model"
+            type="text"
+            value={model}
+            onChange={e => setModel(e.target.value)}
+            placeholder={DEFAULT_CHAT_SETTINGS.model}
+            className={inputClass}
+          />
+        )}
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={handleSave}
+          className="rounded-md bg-sky-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-600">
+          Save
+        </button>
+        {saved && <span className="text-sm text-green-600">Saved</span>}
+      </div>
+    </section>
+  );
+};
