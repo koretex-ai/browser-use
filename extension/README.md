@@ -11,6 +11,13 @@ Forked from [Nanobrowser](https://github.com/nanobrowser/nanobrowser) (Apache-2.
   ```bash
   ollama pull qwen3.5:4b
   ```
+- Ollama must allow requests from the extension origin, or every request gets HTTP 403:
+  ```bash
+  # simplest (plain `ollama serve` or the Ollama app):
+  OLLAMA_ORIGINS="chrome-extension://*" ollama serve
+  ```
+  For a Homebrew service, add `OLLAMA_ORIGINS` to the `EnvironmentVariables` dict in
+  `~/Library/LaunchAgents/homebrew.mxcl.ollama.plist` and `launchctl unload`/`load` it.
 
 ## Build & load
 
