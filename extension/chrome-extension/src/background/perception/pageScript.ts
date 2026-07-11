@@ -99,7 +99,15 @@ export function extractInteractiveElements(showHighlights: boolean): ExtractedPa
   // Drop elements whose interactive ancestor is already included (e.g. span inside <a>)
   const elements = visible.filter(el => !visible.some(other => other !== el && composedContains(other, el)));
 
-  win.__lbu = { elements };
+  // Registry keeps rects too: SPA pages (GitHub etc.) re-render between
+  // perceive and act, so stale refs fall back to a position-based click
+  win.__lbu = {
+    elements,
+    rects: elements.map(el => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height };
+    }),
+  };
 
   const state: ExtractedPageState = {
     url: window.location.href,
@@ -161,29 +169,71 @@ export function removeHighlights(): void {
   document.getElementById('__lbu_highlights')?.remove();
 }
 
-// Click the element registered at the given index by the last extraction
-export function clickElementByIndex(index: number): { ok: boolean; error?: string } {
+// Click the element registered at the given index by the last extraction.
+// If the ref went stale (SPA re-rendered between perceive and act), recover
+// by hit-testing the element's remembered position.
+export function clickElementByIndex(index: number): { ok: boolean; error?: string; recovered?: boolean } {
   const win = window as any;
-  const el: HTMLElement | undefined = win.__lbu?.elements?.[index];
-  if (!el || !el.isConnected) return { ok: false, error: `No element at index ${index} — run /state to refresh` };
+  let el: HTMLElement | undefined = win.__lbu?.elements?.[index];
+  let recovered = false;
+
+  if (!el || !el.isConnected) {
+    const rect = win.__lbu?.rects?.[index];
+    if (!rect) return { ok: false, error: `No element at index ${index} — the page changed, using the new PAGE list` };
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    let hit = document.elementFromPoint(cx, cy);
+    while (hit?.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(cx, cy);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    if (!hit) {
+      return { ok: false, error: `Element at index ${index} disappeared — the page changed, using the new PAGE list` };
+    }
+    const INTERACTIVE =
+      'a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], ' +
+      '[role="menuitem"], [role="option"], [role="checkbox"], [onclick], [contenteditable="true"]';
+    let node: Node | null = hit;
+    let match: HTMLElement | null = null;
+    while (node) {
+      if (node instanceof HTMLElement && node.matches(INTERACTIVE)) {
+        match = node;
+        break;
+      }
+      node = node.parentNode ?? ((node.getRootNode() as ShadowRoot | Document) as ShadowRoot).host ?? null;
+      if (node instanceof ShadowRoot) node = node.host;
+    }
+    el = match ?? (hit as HTMLElement);
+    recovered = true;
+  }
+
   el.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
   const rect = el.getBoundingClientRect();
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
   for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
     el.dispatchEvent(
-      new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }),
+      new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: cx,
+        clientY: cy,
+      }),
     );
   }
   el.click();
-  return { ok: true };
+  return { ok: true, recovered };
 }
 
 // Type text into the element registered at the given index
 export function typeIntoElement(index: number, text: string): { ok: boolean; error?: string } {
   const win = window as any;
   const el: HTMLElement | undefined = win.__lbu?.elements?.[index];
-  if (!el || !el.isConnected) return { ok: false, error: `No element at index ${index} — run /state to refresh` };
+  if (!el || !el.isConnected)
+    return { ok: false, error: `No element at index ${index} — the page changed, using the new PAGE list` };
   el.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
   el.focus();
 
@@ -263,8 +313,9 @@ export function getViewportSize(): { width: number; height: number } {
   return { width: window.innerWidth, height: window.innerHeight };
 }
 
-// Scroll the page by roughly one viewport
-export function scrollPage(direction: 'up' | 'down', amount?: number): { ok: boolean } {
+// Scroll the page by roughly one viewport.
+// amount is number|null (never undefined — executeScript args must serialize).
+export function scrollPage(direction: 'up' | 'down', amount: number | null): { ok: boolean } {
   const dy = (amount ?? Math.round(window.innerHeight * 0.75)) * (direction === 'down' ? 1 : -1);
   window.scrollBy({ top: dy, behavior: 'instant' as ScrollBehavior });
   return { ok: true };

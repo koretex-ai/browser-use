@@ -33,7 +33,10 @@ async function performAction(tabId: number, action: Action): Promise<ActionResul
       if (!result?.ok) return { ok: false, message: result?.error ?? 'Click failed' };
       await sleep(POST_ACTION_DELAY_MS);
       await waitForTabLoad(tabId);
-      return { ok: true, message: `Clicked element [${action.index}]` };
+      return {
+        ok: true,
+        message: `Clicked element [${action.index}]${result.recovered ? ' (page had re-rendered; clicked its last known position)' : ''}`,
+      };
     }
     case 'click_at': {
       const result = await runInPage(tabId, clickAtPoint, action.x, action.y);
@@ -51,7 +54,8 @@ async function performAction(tabId: number, action: Action): Promise<ActionResul
       return { ok: true, message: `Typed "${action.text}" into element [${action.index}]` };
     }
     case 'scroll': {
-      await runInPage(tabId, scrollPage, action.direction, action.amount);
+      // undefined is not serializable as an executeScript arg — pass null
+      await runInPage(tabId, scrollPage, action.direction, action.amount ?? null);
       await sleep(300);
       return { ok: true, message: `Scrolled ${action.direction}` };
     }
