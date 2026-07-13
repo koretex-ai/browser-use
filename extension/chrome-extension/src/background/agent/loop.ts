@@ -12,7 +12,7 @@ import type { PlannerDecision, PlannerEndpoint } from './planner';
 import { PLANNER_SYSTEM_PROMPT, VALIDATOR_SYSTEM_PROMPT, formatPlannerTurn, formatValidatorTurn } from './prompts';
 import { isOrchestratorConfigured, triageTask, checkpoint, rescueSubtask, salvageAnswer } from './orchestrator';
 import type { Subtask, SubtaskOutcome, CallUsage, ProgramStep } from './orchestrator';
-import { runProgramSubtask } from './program';
+import { runProgramSubtask, listLines, itemKey } from './program';
 import { recipeLibraryDigest, instantiateRecipe, parameterizeSubtask, saveRecipeCandidate } from './recipes';
 
 const logger = createLogger('agent');
@@ -664,7 +664,7 @@ async function runOrchestratedTask(
     // partial recipe before salvaging the answer
     await maybeSaveRecipe();
     try {
-      const { answer, usage } = await salvageAnswer(task, leanOutcomes(outcomes), signal, ledger);
+      const { answer, usage } = await salvageAnswer(task, leanOutcomes(outcomes), signal, ledger, collection);
       finishFail(`${answer}\n\n(${reason})`, track(usage));
     } catch (error) {
       logger.warning('salvage failed:', error);
@@ -692,8 +692,21 @@ async function runOrchestratedTask(
   // even when the subtask that gathered it failed. Flows into checkpoints,
   // rescues, salvage, and (as seed notes) into later subtasks.
   const ledger: string[] = [];
+  // Structured collection store: every list-item line from every extract,
+  // deduplicated, kept UNTRUNCATED. Steps with textFrom:"collected" write
+  // these to the page verbatim — the ledger is a lossy digest for the
+  // orchestrator's judgment; this store is the data itself, and it never
+  // needs to cross the cloud boundary.
+  const collection: string[] = [];
+  const collectionKeys = new Set<string>();
   const recordExtract = (query: string, answer: string) => {
     ledger.push(`${query} -> ${answer.replace(/\n/g, ' ').slice(0, 700)}`);
+    for (const line of listLines(answer)) {
+      const key = itemKey(line);
+      if (!key || collectionKeys.has(key)) continue;
+      collectionKeys.add(key);
+      collection.push(line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim());
+    }
   };
   // What each rescue decided, so later rescues don't thrash between strategies
   const rescueLog: string[] = [];
@@ -751,6 +764,7 @@ async function runOrchestratedTask(
               stepPrefix,
               onExtract: recordExtract,
               knownData,
+              collectedItems: () => collection,
             },
             signal,
           )
@@ -875,6 +889,15 @@ async function runOrchestratedTask(
     }
   };
 
+  // Scout: a text-only digest of the tab the task starts on (URL, title,
+  // element labels — the same boundary class as rescue payloads), so the
+  // first plan is grounded in the actual page instead of discovering it one
+  // paid replan at a time
+  const scoutState = await capturePageState(tabId, false).catch(() => null);
+  const pageDigest = scoutState
+    ? `${scoutState.title} — ${scoutState.url}\nELEMENTS:\n${elementsDigestOf(scoutState).slice(0, 30).join('\n')}`
+    : undefined;
+
   // Recipe library: saved programs from previous successful runs. Triage sees
   // a one-line digest of each and may match instead of planning (~$0.001
   // parameter fill vs ~$0.01-0.02 cold compile).
@@ -883,7 +906,7 @@ async function runOrchestratedTask(
     return [];
   });
 
-  const initialTriage = await triageTask(task, signal, recipeLibraryDigest(recipes));
+  const initialTriage = await triageTask(task, signal, recipeLibraryDigest(recipes), pageDigest);
   let triage = initialTriage.result;
   let triageMeta = track(initialTriage.usage);
   logger.info('triage:', JSON.stringify(triage).slice(0, 300));
@@ -896,7 +919,7 @@ async function runOrchestratedTask(
       activeRecipe = { recipe: matched, params: triage.params ?? {} };
     } else {
       logger.warning('triage chose an unknown recipe id, re-triaging without the library:', triage.recipeId);
-      const retriage = await triageTask(task, signal);
+      const retriage = await triageTask(task, signal, undefined, pageDigest);
       triage = retriage.result;
       triageMeta = track(retriage.usage);
     }
@@ -1068,7 +1091,10 @@ async function runOrchestratedTask(
 
       let checkpointCall;
       try {
-        checkpointCall = await checkpoint(task, plan, leanOutcomes(outcomes), signal, ledger);
+        checkpointCall = await checkpoint(task, plan, leanOutcomes(outcomes), signal, ledger, {
+          replansRemaining: Math.max(0, MAX_REPLANS - record.replans),
+          collectedCount: collection.length,
+        });
       } catch (error) {
         if (signal.aborted) throw error;
         // The checkpoint is orchestration, not execution — its failure must
@@ -1112,7 +1138,10 @@ async function runOrchestratedTask(
     // of discarding the orchestrator's own instructions.
     let finalCall;
     try {
-      finalCall = await checkpoint(task, plan, leanOutcomes(outcomes), signal, ledger);
+      finalCall = await checkpoint(task, plan, leanOutcomes(outcomes), signal, ledger, {
+        replansRemaining: Math.max(0, MAX_REPLANS - record.replans),
+        collectedCount: collection.length,
+      });
     } catch (error) {
       if (signal.aborted) throw error;
       logger.warning('final checkpoint failed:', error);

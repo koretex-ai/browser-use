@@ -38,6 +38,12 @@ export interface ProgramContext {
   onExtract?: (query: string, answer: string) => void;
   /** Live view of already-collected data, so extracts report only NEW items */
   knownData?: () => string[];
+  /**
+   * Live view of the task's FULL collection store (untruncated items). Steps
+   * with textFrom:"collected" expand to these at execution time — collected
+   * data reaches the page verbatim without a cloud round-trip.
+   */
+  collectedItems?: () => string[];
 }
 
 function elementsDigestOf(state: PerceptionSnapshot | null): string[] {
@@ -99,9 +105,13 @@ function describeStep(step: ProgramStep): string {
     case 'click':
       return `click "${step.target}"`;
     case 'type':
-      return `type "${step.text}" into "${step.target}"`;
+      return step.textFrom === 'collected'
+        ? `type the collected data into "${step.target}"`
+        : `type "${step.text}" into "${step.target}"`;
     case 'type_focused':
-      return `type ${String(step.text ?? '').split('\n').length} line(s) into the focused editor`;
+      return step.textFrom === 'collected'
+        ? 'type the collected data into the focused editor'
+        : `type ${String(step.text ?? '').split('\n').length} line(s) into the focused editor`;
     case 'key':
       return `press ${step.combo}`;
     case 'scroll':
@@ -114,12 +124,14 @@ function describeStep(step: ProgramStep): string {
       return `verify visually: "${step.question}"`;
     case 'wait':
       return `wait ${step.ms ?? 1000}ms`;
+    case 'wait_for':
+      return `wait for "${step.target}" to appear`;
     default:
       return JSON.stringify(step).slice(0, 80);
   }
 }
 
-function listLines(answer: string): string[] {
+export function listLines(answer: string): string[] {
   return answer.split('\n').filter(line => /^\s*(?:[-*•]|\d+[.)])/.test(line));
 }
 
@@ -131,7 +143,7 @@ function countItems(answer: string): number {
 // Normalize a harvested line to a dedup key: bullets/numbering, digits
 // (engagement counts, list positions) and whitespace/case must not
 // distinguish two sightings of the same item
-function itemKey(line: string): string {
+export function itemKey(line: string): string {
   return line
     .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '')
     .toLowerCase()
@@ -266,6 +278,18 @@ export async function runProgramSubtask(
     return { newItems, note: reported.slice(0, 160) };
   };
 
+  // A step's text, with textFrom:"collected" expanded from the task's local
+  // collection store — the full untruncated items, joined below any literal
+  // text (which serves as a header line)
+  const resolveStepText = (step: ProgramStep): string | undefined => {
+    if (step.textFrom === 'collected') {
+      const items = ctx.collectedItems?.() ?? [];
+      if (items.length === 0) return undefined;
+      return [step.text, ...items].filter(Boolean).join('\n');
+    }
+    return step.text;
+  };
+
   const execStep = async (step: ProgramStep): Promise<{ ok: boolean; message: string }> => {
     switch (step.do) {
       case 'navigate':
@@ -274,12 +298,44 @@ export async function runProgramSubtask(
       case 'key':
         if (!step.combo) return { ok: false, message: 'key step has no combo' };
         return executeAction(tabId, taskId, { type: 'key', combo: step.combo }, lastState, logContextFor(step));
-      case 'type_focused':
-        if (!step.text) return { ok: false, message: 'type_focused step has no text' };
-        return executeAction(tabId, taskId, { type: 'type_focused', text: step.text }, lastState, logContextFor(step));
+      case 'type_focused': {
+        const text = resolveStepText(step);
+        if (!text) {
+          return {
+            ok: false,
+            message:
+              step.textFrom === 'collected'
+                ? 'textFrom:"collected" but the collection store is empty — nothing has been harvested/extracted yet'
+                : 'type_focused step has no text',
+          };
+        }
+        return executeAction(tabId, taskId, { type: 'type_focused', text }, lastState, logContextFor(step));
+      }
       case 'wait':
         await sleep(Math.min(step.ms ?? 1000, 10000));
         return { ok: true, message: `waited ${step.ms ?? 1000}ms` };
+      case 'wait_for': {
+        // Readiness condition instead of a blind delay: poll until the target
+        // text appears in the page text or matches an element label
+        if (!step.target) return { ok: false, message: 'wait_for step has no target text' };
+        const timeout = Math.min(step.ms ?? 10000, 20000);
+        const deadline = Date.now() + timeout;
+        const wanted = step.target.toLowerCase();
+        for (;;) {
+          if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+          const state = await perceive();
+          if (state) {
+            const inText = (state.pageText ?? '').toLowerCase().includes(wanted);
+            if (inText || resolveTarget(state, step.target) !== null) {
+              return { ok: true, message: `"${step.target}" appeared` };
+            }
+          }
+          if (Date.now() >= deadline) {
+            return { ok: false, message: `"${step.target}" did not appear within ${timeout}ms` };
+          }
+          await sleep(800);
+        }
+      }
       case 'scroll': {
         const times = Math.min(step.times ?? 1, 10);
         for (let i = 0; i < times; i++) {
@@ -318,12 +374,13 @@ export async function runProgramSubtask(
         }
       }
       case 'type': {
-        if (!step.target || !step.text) return { ok: false, message: 'type step needs target and text' };
+        const text = resolveStepText(step);
+        if (!step.target || !text) return { ok: false, message: 'type step needs target and text' };
         const state = await perceive();
         if (!state) return { ok: false, message: 'could not read the page to locate the input' };
         const index = resolveTarget(state, step.target);
         if (index === null) return { ok: false, message: `no input element matching "${step.target}"` };
-        return executeAction(tabId, taskId, { type: 'type', index, text: step.text }, state, logContextFor(step));
+        return executeAction(tabId, taskId, { type: 'type', index, text }, state, logContextFor(step));
       }
       case 'extract': {
         if (!step.query) return { ok: false, message: 'extract step has no query' };
@@ -359,15 +416,23 @@ export async function runProgramSubtask(
           // new (the reader can saturate while the page keeps loading)
           if (sig === lastSig || newItems === 0) {
             noChange++;
-            if (noChange >= HARVEST_NO_CHANGE_LIMIT) {
-              return { ok: true, message: `collected ${total} unique items; results stopped yielding new ones` };
-            }
+            if (noChange >= HARVEST_NO_CHANGE_LIMIT) break;
           } else {
             noChange = 0;
           }
           lastSig = sig;
         }
-        return { ok: true, message: `collected ${total} unique items in ${maxScrolls} scrolls` };
+        // Zero yield is a FAILURE, not a completed collection: it routes to
+        // the rescue ladder (per-subtask budget) instead of costing the
+        // checkpoint a scarce replan to notice the emptiness
+        if (total === 0) {
+          return {
+            ok: false,
+            message:
+              'harvest collected 0 items — the results may not have rendered yet (add wait_for before harvesting) or the query matched nothing on this page',
+          };
+        }
+        return { ok: true, message: `collected ${total} unique items (results stopped yielding new ones)` };
       }
       default:
         return { ok: false, message: `unknown step "${String(step.do)}"` };

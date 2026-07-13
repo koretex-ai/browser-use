@@ -9,8 +9,11 @@ const logger = createLogger('orchestrator');
  * final validated answer.
  *
  * HARD RULE: payloads are digest-only. This module has no access to
- * screenshots or raw element lists by construction — only the task text,
- * plan state, and structured subtask outcome summaries cross the boundary.
+ * screenshots by construction — only the task text, plan state, structured
+ * subtask outcome summaries, and element-label digests (at triage and on
+ * rescue) cross the boundary. Page-text excerpts cross only where the
+ * cloud-executor gate is open. Collected datasets are written to pages via
+ * textFrom:"collected" WITHOUT crossing the boundary at all.
  */
 
 /**
@@ -31,10 +34,19 @@ export interface ProgramStep {
     | 'harvest'
     | 'verify_visual'
     | 'wait'
+    | 'wait_for'
     | string;
   url?: string;
+  /** click/type: element description; wait_for: text that must appear */
   target?: string;
   text?: string;
+  /**
+   * type/type_focused: insert the task's ENTIRE local collection store
+   * (untruncated harvested items) at execution time, below any literal
+   * `text` (which becomes a header line). The data never round-trips
+   * through the cloud.
+   */
+  textFrom?: 'collected';
   combo?: string;
   query?: string;
   /** verify_visual: question answered from a screenshot by the local VLM */
@@ -44,6 +56,7 @@ export interface ProgramStep {
   maxScrolls?: number;
   direction?: 'up' | 'down';
   times?: number;
+  /** wait: delay; wait_for: timeout (default 10000, max 20000) */
   ms?: number;
 }
 
@@ -141,14 +154,17 @@ const STEP_FORMS = `Each subtask should include "steps": an exact program the br
 {"do":"key","combo":"Enter"}  (submit a search box after typing into it)
 {"do":"scroll","direction":"down","times":2}
 {"do":"extract","query":"<what to read from the page text>"}  (a local reader answers from page text; results accumulate in the task's data ledger)
-{"do":"harvest","query":"<items to collect>","until":10}  (scroll+extract loop until ~N unique items are collected or results stop loading — USE THIS for any collect-N-things-from-a-feed work)
+{"do":"harvest","query":"<items to collect>","until":10}  (scroll+extract loop until ~N unique items are collected or results stop loading — USE THIS for any collect-N-things-from-a-feed work. Unique items are counted and deduplicated by the runtime; a harvest that collects 0 items FAILS the subtask)
 {"do":"verify_visual","question":"<yes/no question about what is visible on screen>"}  (a local vision model answers from a screenshot — the ONLY way to verify content inside canvas editors, since text extraction cannot see it; e.g. "Does the document body show a list titled 'Top 5 Voices'?")
-{"do":"wait","ms":1500}
+{"do":"wait_for","target":"<text that must appear on the page>","ms":10000}  (poll until the text appears, then continue; fails after the timeout. ALWAYS use this instead of a blind wait after navigating to a page whose content you will read or act on — e.g. after opening search results, wait_for a word you expect in them)
+{"do":"wait","ms":1500}  (blind delay — last resort when there is no known text to wait for)
+
+WRITING COLLECTED DATA: any type/type_focused step may use "textFrom":"collected" instead of composing the data into "text". The runtime inserts EVERY item the task has harvested/extracted so far, complete and verbatim, below the optional "text" (which becomes a header line, e.g. column headers). This is the ONLY reliable way to write a collected dataset — the ledger digests you see are truncated, so never paste them into "text" yourself. Because items are inserted verbatim, harvest queries for data that will be written somewhere must ask for each item ALREADY FORMATTED as it should appear (e.g. "format each record as: Name<TAB>Title<TAB>Company").
 Targets are element DESCRIPTIONS (visible text labels), resolved on the live page by label matching with a vision fallback — never invent element indices. A step that fails stops the subtask and comes back to you with the page state. Omit "steps" (goal-only subtask) ONLY when the work genuinely needs on-page judgment; a small unreliable local model then improvises it — strongly prefer steps.
 
 Canvas editors (Google Docs/Sheets): the editor is ALREADY FOCUSED when the document opens — go straight to type_focused. Never click menus, toolbars or mode buttons first (clicking steals focus and the keystrokes land in the wrong place); if UI state is uncertain, use {"do":"key","combo":"Escape"} before typing. Type PLAIN TEXT into documents — no markdown syntax like # or ** (WYSIWYG editors render it literally). End every canvas-write subtask with a verify_visual step that checks the typed content is visible in the document. NEVER put placeholder text (like "[to be filled]") in a typed step — compose the complete final text from the data you have; if the data is not collected yet, leave the subtask goal-only and compile it at a later checkpoint when the data exists.`;
 
-const TRIAGE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent that runs in a Chrome side panel. You compile the user's task into subtask PROGRAMS that a deterministic runtime executes against the user's active tab. Local models handle perception (locating described elements, reading page text) but do not make decisions. You never see the page yourself — plan from the task alone.
+const TRIAGE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent that runs in a Chrome side panel. You compile the user's task into subtask PROGRAMS that a deterministic runtime executes against the user's active tab. Local models handle perception (locating described elements, reading page text) but do not make decisions. You cannot browse yourself — you may receive CURRENT PAGE: a text digest (URL, title, element labels) of the active tab as the task starts. Ground the plan in it: if the task starts on this page, act on what is actually there instead of guessing; if the page is irrelevant, plan navigation as usual.
 
 Classify the user's request and reply ONLY with a JSON object:
 {"mode": "chat" | "execute" | "plan" | "recipe", "reply": "<answer for chat>", "subtasks": [{"goal": "...", "success": "...", "steps": [...]}], "recipeId": "<id>", "params": {"<name>": "<value>"}}
@@ -172,15 +188,17 @@ Reply ONLY with a JSON object:
 ${STEP_FORMS}
 
 - "continue": the plan is on track AND the remaining subtasks complete the user's full deliverable. If the remaining plan is missing the step that delivers (e.g. data was collected and the destination opened, but nothing writes the data), do NOT continue — replan to add it.
-- "replan": the last outcome requires CHANGING COURSE. Provide the REMAINING subtasks (same format as planning, WITH "steps" programs) that replace the rest of the plan. Do NOT re-plan work the outcomes/evidence show is already done — e.g. a search already visited and harvested should not be searched again; move to the next untried approach or the next stage of the task. Replans are BUDGETED (a few per task): do not spend them polishing a plan that is working — if the remaining plan is reasonable, "continue" through it even when one outcome was mediocre. The moment DATA COLLECTED is sufficient for the user's deliverable, replan DIRECTLY to the deliverable subtasks (write/save/verify) — never schedule more collection than the task needs.
+- "replan": the last outcome requires CHANGING COURSE. Provide the REMAINING subtasks (same format as planning, WITH "steps" programs) that replace the rest of the plan. Do NOT re-plan work the outcomes/evidence show is already done — e.g. a search already visited and harvested should not be searched again; move to the next untried approach or the next stage of the task. Replans are BUDGETED — you are told REPLANS REMAINING. Do not spend them polishing a plan that is working: if the remaining plan is reasonable, "continue" through it even when one outcome was mediocre. The moment DATA COLLECTED is sufficient for the user's deliverable, replan DIRECTLY to the deliverable subtasks (write/save/verify) — never schedule more collection than the task needs.
+
+DELIVER BEFORE THE BUDGET DIES: when REPLANS REMAINING is 1 or 0 and data has been collected, the ONLY acceptable replan is one that produces the user's deliverable with the data already in hand — never more collection. A sheet with 16 of 20 requested rows delivered is success with a caveat; 20 rows collected but never written is failure. The same logic applies at every stage: weigh "one more improvement" against the risk of delivering nothing.
 - "done": the user's TASK is fully accomplished. Write the final answer for the user in "answer", grounded ONLY in the outcome summaries and evidence — never invent facts that are not in them.
 - "fail": the task cannot be completed (explain in "reason").
 
 The most recent outcome includes "evidence": the interactive-element labels (and possibly a page text excerpt) captured AFTER it ran. Judge success against this evidence, not guesses — e.g. a closed composer dialog and a feed showing the posted text IS evidence the post succeeded.
 
-You may also receive DATA COLLECTED SO FAR: information the agent extracted from pages earlier in this task. This survives even when the subtask that gathered it failed. When you replan subtasks that USE collected data (filling forms, spreadsheets, composing messages), paste the ACTUAL VALUES into the subtask goals — the executor cannot see the data any other way. When enough data is already collected, do not replan its re-collection.
+You may also receive DATA COLLECTED SO FAR: truncated digests of what the agent extracted from pages earlier in this task (the full untruncated items live in the local collection store — you are told its item count). This survives even when the subtask that gathered it failed. When enough data is already collected, do not replan its re-collection.
 
-RE-COMPILE DATA-WRITING SUBTASKS: when the NEXT pending subtask writes collected data (typing a list into a document, filling a form) and its steps do not already contain the complete, current, literal content — including when they were compiled earlier and the DATA COLLECTED has grown since, or they contain any placeholder text — respond "replan" and emit that subtask as a program whose type/type_focused step contains the COMPLETE literal text, composed by you from DATA COLLECTED SO FAR. Never leave a data-writing subtask for the small local model to improvise — it truncates long text.
+DATA-WRITING SUBTASKS use "textFrom":"collected" — a type/type_focused step with it inserts the ENTIRE local collection store verbatim at execution time. NEVER compose the dataset into "text" yourself: the digests you see are truncated, so a hand-pasted list is silently incomplete. Put only header/framing text (e.g. column headers) in "text". For SHORT composed content that is not a collected dataset (a post, a message), literal "text" is still right. Never leave a data-writing subtask goal-only for the small local model to improvise — it truncates long text.
 
 CANVAS EDITORS ARE UNVERIFIABLE BY TEXT EXTRACTION: Google Docs/Sheets render content on a canvas, so page-text evidence CANNOT see what is inside the document — seeing only sidebar/placeholder text does NOT mean the document is empty. To verify a canvas write, use a {"do":"verify_visual","question":"..."} step — a local vision model reads the screenshot. When a type_focused step completed with correct focus discipline (Escape first, no menu clicks in between) and no visual verification is available, treat the write as successful with the caveat "content not verifiable by text extraction". NEVER re-type unless verify_visual gives POSITIVE evidence the content is absent — blind re-typing duplicates content.
 
@@ -322,13 +340,15 @@ export async function triageTask(
   task: string,
   signal: AbortSignal,
   recipeDigest?: string[],
+  pageDigest?: string,
 ): Promise<{ result: TriageResult; usage: CallUsage }> {
   const librarySection = recipeDigest?.length
     ? `\n\nRECIPE LIBRARY (saved programs from previous successful runs):\n${recipeDigest.join('\n')}`
     : '';
+  const pageSection = pageDigest ? `\n\nCURRENT PAGE (the active tab as the task starts):\n${pageDigest}` : '';
   const { value: result, usage } = await callOrchestrator<TriageResult>(
     TRIAGE_SYSTEM_PROMPT,
-    `TASK: ${task}${librarySection}`,
+    `TASK: ${task}${pageSection}${librarySection}`,
     signal,
   );
   if (!['chat', 'execute', 'plan', 'recipe'].includes(result.mode)) {
@@ -425,17 +445,29 @@ export async function rescueSubtask(
   return { result, usage };
 }
 
+export interface CheckpointBudget {
+  /** How many replans the run can still afford */
+  replansRemaining: number;
+  /** Items in the local collection store (insertable via textFrom:"collected") */
+  collectedCount: number;
+}
+
 export async function checkpoint(
   task: string,
   plan: Subtask[],
   outcomes: SubtaskOutcome[],
   signal: AbortSignal,
   ledger?: string[],
+  budget?: CheckpointBudget,
 ): Promise<{ result: CheckpointResult; usage: CallUsage }> {
+  const budgetSection = budget
+    ? `\n\nREPLANS REMAINING: ${budget.replansRemaining}\nLOCAL COLLECTION STORE: ${budget.collectedCount} item${budget.collectedCount === 1 ? '' : 's'} (insertable in full via "textFrom":"collected")`
+    : '';
   const userContent =
     `TASK: ${task}\n\n` +
     `PLAN:\n${plan.map((s, i) => `${i + 1}. ${s.goal} (success: ${s.success})`).join('\n')}\n\n` +
     `OUTCOMES SO FAR (JSON):\n${JSON.stringify(outcomes, null, 1)}` +
+    budgetSection +
     ledgerSection(ledger);
   const { value: result, usage } = await callOrchestrator<CheckpointResult>(
     CHECKPOINT_SYSTEM_PROMPT,
@@ -463,8 +495,18 @@ export async function salvageAnswer(
   outcomes: SubtaskOutcome[],
   signal: AbortSignal,
   ledger?: string[],
+  collection?: string[],
 ): Promise<{ answer: string; usage: CallUsage }> {
-  const userContent = `TASK: ${task}\n\nOUTCOMES (JSON):\n${JSON.stringify(outcomes, null, 1)}` + ledgerSection(ledger);
+  // The full collection store (not the truncated ledger digests) — the last
+  // call of the run deserves the complete data so the partial answer can
+  // list every item that was actually gathered
+  const collectionSection = collection?.length
+    ? `\n\nCOLLECTED ITEMS (complete, deduplicated):\n${collection.slice(0, 100).join('\n').slice(0, 8000)}`
+    : '';
+  const userContent =
+    `TASK: ${task}\n\nOUTCOMES (JSON):\n${JSON.stringify(outcomes, null, 1)}` +
+    ledgerSection(ledger) +
+    collectionSection;
   const { value, usage } = await callOrchestrator<{ answer: string }>(
     SALVAGE_SYSTEM_PROMPT,
     userContent,
