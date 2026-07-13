@@ -1,7 +1,13 @@
 import { chatSettingsStore } from '@extension/storage';
 import { createLogger } from '../log';
+import { fetchWithTimeout } from '../net';
 
 const logger = createLogger('orchestrator');
+
+// A cloud PLAN/REFLECT/REPORT call gets this long to respond before it is
+// treated as a stall — long enough for a big plan, short enough that a wedged
+// connection surfaces as an error instead of an eternal spinner
+const CLOUD_CALL_TIMEOUT_MS = 90_000;
 
 /**
  * Cloud planner/reflector for the plan–act–verify architecture. One strong
@@ -83,9 +89,11 @@ export interface ProgramStep {
 }
 
 export interface PlanResult {
-  mode: 'chat' | 'plan';
+  mode: 'chat' | 'plan' | 'clarify';
   /** Unused for chat (the reply is streamed separately with history) */
   reply?: string;
+  /** 1-3 questions for the user for mode=clarify */
+  questions?: string[];
   /** The complete program for mode=plan */
   steps?: ProgramStep[];
   /** 1-4 expects that define success of the WHOLE objective */
@@ -131,9 +139,10 @@ const PLAN_SYSTEM_PROMPT = `You are the planner for a browser agent running in a
 THINK BEFORE YOU PLAN. First work out what outcome the user would actually consider success — the intent behind their words — and design the plan to produce that outcome. For each step, ask what the real site will actually do or return in response; choose queries, URLs, and actions for the results they will produce, not for surface similarity to the user's phrasing. A plan that executes flawlessly but produces the wrong thing is a failed plan. When a JOURNAL is present, study it before planning: understand what was tried, what failed, and WHY — then design the new plan to work around those causes, not to repeat or merely reword them.
 
 Reply ONLY with a JSON object:
-{"mode": "chat" | "plan", "steps": [...], "objective": [{...expect...}]}
+{"mode": "chat" | "plan" | "clarify", "steps": [...], "objective": [{...expect...}], "questions": ["..."]}
 
 - "chat": no browser needed (questions, conversation). The reply is streamed by a separate call.
+- "clarify": the objective is genuinely ambiguous in a way that would change the plan or risk producing the WRONG result, and no reasonable default resolves it. Reply with 1-3 specific "questions". Ask ONLY when you truly cannot proceed sensibly — never for things you can reasonably assume; when a sane default exists, take it, note the assumption, and plan. Do not ask about details you would discover on the page anyway. (You are told PLANS USED n/N — only ask on the first plan, never mid-task.)
 - "plan": the COMPLETE program to achieve the objective end to end — including the final write/save/deliver steps, max 25 steps. If the task says to save/write/post something, the plan must contain the steps that actually do it, not just open the destination.
 
 ${STEP_FORMS}
@@ -200,22 +209,26 @@ async function callOrchestrator<T>(
   const request = async (
     messages: { role: string; content: string }[],
   ): Promise<{ content: string; usage: CallUsage }> => {
-    const response = await fetch(`${orchestratorBaseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${orchestratorApiKey}`,
-        'HTTP-Referer': 'https://github.com/koretex-ai/local-browser-use',
-        'X-Title': 'Local Browser Use',
+    const response = await fetchWithTimeout(
+      `${orchestratorBaseUrl.replace(/\/$/, '')}/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${orchestratorApiKey}`,
+          'HTTP-Referer': 'https://github.com/koretex-ai/local-browser-use',
+          'X-Title': 'Local Browser Use',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.2,
+          usage: { include: true },
+        }),
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.2,
-        usage: { include: true },
-      }),
       signal,
-    });
+      CLOUD_CALL_TIMEOUT_MS,
+    );
     if (!response.ok) {
       const detail = (await response.text().catch(() => '')).slice(0, 200);
       throw new Error(`Orchestrator request failed (HTTP ${response.status}): ${detail}`);
@@ -282,7 +295,7 @@ export async function planTask(
   const userContent =
     `OBJECTIVE: ${objective}\n\nPLANS USED: ${plansUsed} of ${maxPlans}` + pageSection + journalSection(journal);
   const { value: result, usage } = await callOrchestrator<PlanResult>(PLAN_SYSTEM_PROMPT, userContent, signal);
-  if (!['chat', 'plan'].includes(result.mode)) {
+  if (!['chat', 'plan', 'clarify'].includes(result.mode)) {
     throw new Error(`Planner returned invalid mode: ${String(result.mode)}`);
   }
   return { result, usage };

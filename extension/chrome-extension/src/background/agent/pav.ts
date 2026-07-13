@@ -1,5 +1,5 @@
-import type { PerceptionSnapshot, TaskRecord } from '@extension/storage';
-import { Actors, trajectoryStore } from '@extension/storage';
+import type { PerceptionSnapshot, TaskRecord, RunStatus } from '@extension/storage';
+import { Actors, trajectoryStore, runStateStore } from '@extension/storage';
 import { createLogger } from '../log';
 import { postExecutionEvent } from '../events';
 import { capturePageState } from '../perception';
@@ -61,6 +61,10 @@ function planFingerprint(steps: ProgramStep[]): string {
 }
 
 const stripBullet = (line: string) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim();
+
+// A message that means "carry on the stalled task" rather than a new request.
+// Explicit resume avoids seeding an unrelated new task with stale collected data.
+const CONTINUATION = /^(continue|resume|keep going|carry on|go on|proceed|finish it|carry on with it)\b/i;
 
 export async function runPavTask(
   port: chrome.runtime.Port,
@@ -128,12 +132,39 @@ export async function runPavTask(
     return state ? `${state.title} — ${state.url}\nELEMENTS:\n${elementsDigestOf(state).join('\n')}` : undefined;
   };
 
-  // Final report; never throws (a failed report falls back to raw journal)
+  // The EFFECTIVE objective: the user's message, unless this run is resuming a
+  // stalled task or answering a clarification — then it is rewritten below to
+  // carry the original goal plus the continuation/answer.
+  let goalText = task;
+  let pendingQuestions: string[] | undefined;
+  let plansUsed = 0;
+
+  // Persist the run's knowledge so a stall/cancel can be resumed. Called
+  // through the run; on a clean finish the state is cleared instead.
+  const persist = async (status: RunStatus) => {
+    try {
+      await runStateStore.setRun({
+        sessionId: taskId,
+        objective: goalText,
+        journal: journal.slice(-JOURNAL_MAX_LINES),
+        collection: collection.slice(),
+        status,
+        pendingQuestions,
+        plansUsed,
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      logger.warning('persist run state failed:', error);
+    }
+  };
+
+  // Final report; never throws (a failed report falls back to raw journal).
+  // A delivered task clears its state; a partial one leaves it RESUMABLE.
   const report = async (status: 'achieved' | 'partial', reason: string): Promise<void> => {
     let meta = '';
     let answer: string;
     try {
-      const result = await reportOutcome(task, status, journal, collection, signal);
+      const result = await reportOutcome(goalText, status, journal, collection, signal);
       answer = result.answer;
       meta = track(result.usage);
     } catch (error) {
@@ -141,8 +172,16 @@ export async function runPavTask(
       logger.warning('report call failed:', error);
       answer = `${reason}\n\nWhat happened:\n${journal.slice(-12).join('\n')}`;
     }
-    if (status === 'achieved') finishOk(answer, meta);
-    else finishFail(reason ? `${answer}\n\n(${reason})` : answer, meta);
+    if (status === 'achieved') {
+      await runStateStore.clearRun(taskId).catch(() => {});
+      finishOk(answer, meta);
+    } else {
+      await persist('stalled');
+      finishFail(
+        `${reason ? `${answer}\n\n(${reason})` : answer}\n\nReply "continue" to resume from where this left off.`,
+        meta,
+      );
+    }
   };
 
   const deadline = startedAt + MAX_TASK_MS;
@@ -157,7 +196,7 @@ export async function runPavTask(
   const curateBeforeWrite = async (meta: string): Promise<string> => {
     if (curated || collection.length === 0) return meta;
     curated = true;
-    const result = await curateCollection(task, collection.slice(), signal);
+    const result = await curateCollection(goalText, collection.slice(), signal);
     const usedMeta = result.usage ? track(result.usage) : meta;
     if (result.items.length && result.items.length !== collection.length) {
       collection.length = 0;
@@ -175,304 +214,396 @@ export async function runPavTask(
     return usedMeta;
   };
 
+  // ---- RESUME / CLARIFY SEEDING ----
+  // A persisted run for this session means the last turn stalled or asked the
+  // user a question. Seed its accumulated knowledge (journal + collection) so
+  // we re-plan against the live page WITH that context — knowledge-replay, not
+  // step-replay (the page it left is stale).
+  const prior = await runStateStore.getRun(taskId).catch(() => null);
+  if (prior) {
+    const seedFromPrior = () => {
+      journal.push(...prior.journal.slice(-JOURNAL_MAX_LINES));
+      for (const item of prior.collection) {
+        const key = itemKey(item);
+        if (key && !collectionKeys.has(key)) {
+          collectionKeys.add(key);
+          collection.push(item);
+        }
+      }
+    };
+    if (prior.status === 'awaiting_clarification') {
+      seedFromPrior();
+      goalText = `${prior.objective}\n\nThe user was asked: ${(prior.pendingQuestions ?? []).join(' ')}\nThe user answered: ${task}`;
+      plansUsed = prior.plansUsed;
+      note(`resumed after clarification — user answered: ${task.slice(0, 160)}`);
+      postExecutionEvent(port, Actors.SYSTEM, 'step.ok', taskId, 'Thanks — continuing with your answer.');
+    } else if (prior.status === 'stalled' && CONTINUATION.test(task.trim())) {
+      seedFromPrior();
+      goalText = prior.objective;
+      plansUsed = prior.plansUsed;
+      note(
+        `resuming a stalled run — ${collection.length} item(s) already collected, ${journal.length} journal lines restored`,
+      );
+      postExecutionEvent(
+        port,
+        Actors.SYSTEM,
+        'step.ok',
+        taskId,
+        `Resuming the previous task — ${collection.length} item(s) already collected.`,
+      );
+    } else {
+      // Unrelated new request — discard the stale run rather than contaminate it
+      await runStateStore.clearRun(taskId).catch(() => {});
+    }
+  }
+
   const priorFingerprints: string[] = [];
-  let plansUsed = 0;
 
   record.mode = 'plan';
 
-  while (plansUsed < MAX_PLANS) {
-    if (signal.aborted) throw new DOMException('aborted', 'AbortError');
-    if (outOfTime()) {
-      await report('partial', `Time budget (${Math.round(MAX_TASK_MS / 60000)} min) exhausted.`);
-      return;
-    }
-
-    // ---- PLAN ----
-    const pageDigest = await scout();
-    let planCall;
-    try {
-      planCall = await planTask(task, journal, pageDigest, plansUsed, MAX_PLANS, signal);
-    } catch (error) {
-      if (signal.aborted) throw error;
-      const message = error instanceof Error ? error.message : String(error);
-      logger.warning('plan call failed:', message);
-      await report('partial', `Planner call failed: ${message.slice(0, 200)}`);
-      return;
-    }
-    const planMeta = track(planCall.usage);
-    const plan = planCall.result;
-    logger.info('plan:', JSON.stringify(plan).slice(0, 400));
-
-    if (plan.mode === 'chat') {
-      record.mode = 'chat';
-      try {
-        const { text, usage } = await streamCloudChatReply(port, taskId, task, signal);
-        finishOk(text || '', usage ? track(usage) : planMeta);
-      } catch (error) {
-        if (signal.aborted) throw error;
-        logger.warning('chat stream failed:', error);
-        finishFail('The chat reply failed to stream.', planMeta);
-      }
-      return;
-    }
-
-    plansUsed++;
-    record.replans = plansUsed - 1;
-    const steps = (plan.steps ?? []).slice(0, MAX_STEPS_PER_PLAN);
-    const objective = (plan.objective ?? []).filter(hasExpectation).slice(0, 4);
-
-    // Conductor-enforced plan validity: no steps; a state-changing step with
-    // no expect; or a DEGENERATE expect (e.g. {"see":"yes"}) that would pass
-    // vacuously. Verification only means something if the expects are real.
-    const expectFaults: string[] = [];
-    for (const [i, step] of steps.entries()) {
-      if (STATE_CHANGING.has(step.do) && !hasExpectation(step.expect)) {
-        expectFaults.push(`step ${i + 1} (${describeStep(step)}) has no expect`);
-      } else if (step.expect) {
-        const degenerate = degenerateExpectReason(step.expect);
-        if (degenerate) expectFaults.push(`step ${i + 1}: ${degenerate}`);
-      }
-    }
-    for (const [i, expect] of objective.entries()) {
-      const degenerate = degenerateExpectReason(expect);
-      if (degenerate) expectFaults.push(`objective check ${i + 1}: ${degenerate}`);
-    }
-    const invalid = steps.length === 0 ? 'the plan has no steps' : expectFaults.join('; ');
-    if (invalid) {
-      note(
-        `plan ${plansUsed} rejected by the runtime: ${invalid}. Every state-changing step needs a REAL, specific expect — a "see" question must ask something concrete about the page, never "yes".`,
-      );
-      postExecutionEvent(port, Actors.SYSTEM, 'step.ok', taskId, `Plan rejected (${invalid}) — replanning.`, planMeta);
-      continue;
-    }
-
-    // Repeat-plan guard: an identical action skeleton to a failed plan gets
-    // one forced-difference warning, then the run stops honestly
-    const fingerprint = planFingerprint(steps);
-    if (priorFingerprints.includes(fingerprint)) {
-      if (priorFingerprints.filter(f => f === fingerprint).length >= 2) {
-        await report('partial', 'The planner kept proposing the same failed plan.');
+  try {
+    while (plansUsed < MAX_PLANS) {
+      if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+      if (outOfTime()) {
+        await report('partial', `Time budget (${Math.round(MAX_TASK_MS / 60000)} min) exhausted.`);
         return;
       }
-      note(`plan ${plansUsed} is IDENTICAL to a previous failed plan — the next plan must take a different approach.`);
-    }
-    priorFingerprints.push(fingerprint);
 
-    postExecutionEvent(
-      port,
-      Actors.SYSTEM,
-      'step.ok',
-      taskId,
-      `Plan ${plansUsed}/${MAX_PLANS} (${steps.length} steps):\n${steps.map((s, i) => `${i + 1}. ${describeStep(s)}`).join('\n')}`,
-      planMeta,
-    );
-    note(`plan ${plansUsed}: ${steps.length} steps toward: ${task.slice(0, 120)}`);
+      // ---- PLAN ----
+      const pageDigest = await scout();
+      let planCall;
+      try {
+        planCall = await planTask(goalText, journal, pageDigest, plansUsed, MAX_PLANS, signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warning('plan call failed:', message);
+        await report('partial', `Planner call failed: ${message.slice(0, 200)}`);
+        return;
+      }
+      const planMeta = track(planCall.usage);
+      const plan = planCall.result;
+      logger.info('plan:', JSON.stringify(plan).slice(0, 400));
 
-    // ---- ACT + VERIFY ----
-    const planId = crypto.randomUUID();
-    const runner = createStepRunner(
-      tabId,
-      taskId,
-      {
-        runId: planId,
-        onExtract: recordExtract,
-        knownData: () => collection.slice(-8).map(entry => entry.slice(0, 250)),
-        collectedItems: () => collection,
-      },
-      signal,
-    );
-
-    let fixes = 0;
-    let replanReason: string | null = null;
-    let stopped = false;
-    const planStart = Date.now();
-
-    let i = 0;
-    while (i < steps.length) {
-      if (signal.aborted) throw new DOMException('aborted', 'AbortError');
-      if (outOfTime()) break;
-      const step = steps[i];
-      const stepLabel = `Step ${i + 1}/${steps.length}: ${describeStep(step)}`;
-      const wasFixed = Boolean((step as { _fixed?: boolean })._fixed);
-
-      // Quality-gate the data the moment before it is written to the document
-      if (step.textFrom === 'collected') await curateBeforeWrite('');
-
-      // Execute + verify, with one silent retry for flakes. Side-effect steps
-      // get exactly ONE attempt — retrying a possibly-landed post/send is the
-      // one mistake this architecture must never make (enforced here, not in
-      // a prompt).
-      const attempts = step.sideEffect ? 1 : 2;
-      let observation = '';
-      let passed = false;
-      for (let attempt = 1; attempt <= attempts; attempt++) {
-        const exec = await runner.execStep(step);
-        if (!exec.ok) {
-          observation = exec.message;
-        } else if (hasExpectation(step.expect)) {
-          const verdict = await verifyExpect(tabId, step.expect!, signal);
-          if (verdict.pass) {
-            passed = true;
-            observation = verdict.observation;
-          } else {
-            observation = verdict.observation;
-          }
-        } else {
-          passed = true;
-          observation = exec.message;
+      if (plan.mode === 'chat') {
+        record.mode = 'chat';
+        try {
+          const { text, usage } = await streamCloudChatReply(port, taskId, task, signal);
+          finishOk(text || '', usage ? track(usage) : planMeta);
+        } catch (error) {
+          if (signal.aborted) throw error;
+          logger.warning('chat stream failed:', error);
+          finishFail('The chat reply failed to stream.', planMeta);
         }
-        if (passed) break;
-        if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, 1200));
+        await runStateStore.clearRun(taskId).catch(() => {});
+        return;
       }
 
-      if (passed) {
+      // ---- CLARIFY ---- only on the first plan; mid-task the journal carries
+      // context and asking would just stall. Post the questions, persist the
+      // run as awaiting an answer, and end the turn — the user's next message
+      // resumes here as the answer.
+      if (plan.mode === 'clarify' && plan.questions?.length && plansUsed === 0) {
+        const questions = plan.questions.slice(0, 3);
+        pendingQuestions = questions;
+        record.outcome = 'ok';
+        record.answer = questions.join('\n');
+        await persist('awaiting_clarification');
+        postExecutionEvent(
+          port,
+          Actors.ASSISTANT,
+          'task.ok',
+          taskId,
+          `Before I start, a couple of things so I get this right:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+          planMeta,
+        );
+        return;
+      }
+
+      plansUsed++;
+      record.replans = plansUsed - 1;
+      const steps = (plan.steps ?? []).slice(0, MAX_STEPS_PER_PLAN);
+      const objective = (plan.objective ?? []).filter(hasExpectation).slice(0, 4);
+
+      // Conductor-enforced plan validity: no steps; a state-changing step with
+      // no expect; or a DEGENERATE expect (e.g. {"see":"yes"}) that would pass
+      // vacuously. Verification only means something if the expects are real.
+      const expectFaults: string[] = [];
+      for (const [i, step] of steps.entries()) {
+        if (STATE_CHANGING.has(step.do) && !hasExpectation(step.expect)) {
+          expectFaults.push(`step ${i + 1} (${describeStep(step)}) has no expect`);
+        } else if (step.expect) {
+          const degenerate = degenerateExpectReason(step.expect);
+          if (degenerate) expectFaults.push(`step ${i + 1}: ${degenerate}`);
+        }
+      }
+      for (const [i, expect] of objective.entries()) {
+        const degenerate = degenerateExpectReason(expect);
+        if (degenerate) expectFaults.push(`objective check ${i + 1}: ${degenerate}`);
+      }
+      const invalid = steps.length === 0 ? 'the plan has no steps' : expectFaults.join('; ');
+      if (invalid) {
+        note(
+          `plan ${plansUsed} rejected by the runtime: ${invalid}. Every state-changing step needs a REAL, specific expect — a "see" question must ask something concrete about the page, never "yes".`,
+        );
         postExecutionEvent(
           port,
           Actors.SYSTEM,
           'step.ok',
           taskId,
-          `${stepLabel} ✓${hasExpectation(step.expect) ? ` (${describeExpect(step.expect!)})` : ''}`,
-          '⚙ verified · $0',
+          `Plan rejected (${invalid}) — replanning.`,
+          planMeta,
         );
-        note(
-          `step ${i + 1} ok: ${describeStep(step)}${observation && observation !== 'expect met' ? ` — ${observation.slice(0, 120)}` : ''}`,
-        );
-        i++;
         continue;
       }
 
-      // ---- REFLECT ----
+      // Repeat-plan guard: an identical action skeleton to a failed plan gets
+      // one forced-difference warning, then the run stops honestly
+      const fingerprint = planFingerprint(steps);
+      if (priorFingerprints.includes(fingerprint)) {
+        if (priorFingerprints.filter(f => f === fingerprint).length >= 2) {
+          await report('partial', 'The planner kept proposing the same failed plan.');
+          return;
+        }
+        note(
+          `plan ${plansUsed} is IDENTICAL to a previous failed plan — the next plan must take a different approach.`,
+        );
+      }
+      priorFingerprints.push(fingerprint);
+
       postExecutionEvent(
         port,
         Actors.SYSTEM,
         'step.ok',
         taskId,
-        `${stepLabel} ✗ — ${observation.slice(0, 160)}`,
-        '⚙ verify failed',
+        `Plan ${plansUsed}/${MAX_PLANS} (${steps.length} steps):\n${steps.map((s, i) => `${i + 1}. ${describeStep(s)}`).join('\n')}`,
+        planMeta,
       );
-      note(`step ${i + 1} FAILED: ${describeStep(step)} — ${observation.slice(0, 180)}`);
+      note(`plan ${plansUsed}: ${steps.length} steps toward: ${goalText.slice(0, 120)}`);
+      await persist('running');
 
-      // A step that was already corrected once and failed again means the
-      // reflector is guessing — force a replan instead of more surgery
-      if (wasFixed || fixes >= MAX_FIXES_PER_PLAN) {
-        replanReason = wasFixed
-          ? `the corrected step also failed: ${observation.slice(0, 160)}`
-          : `too many step corrections in this plan (${fixes})`;
-        note(`forcing replan: ${replanReason}`);
-        break;
-      }
+      // ---- ACT + VERIFY ----
+      const planId = crypto.randomUUID();
+      const runner = createStepRunner(
+        tabId,
+        taskId,
+        {
+          runId: planId,
+          onExtract: recordExtract,
+          knownData: () => collection.slice(-8).map(entry => entry.slice(0, 250)),
+          collectedItems: () => collection,
+        },
+        signal,
+      );
 
-      let reflectCall;
-      try {
-        reflectCall = await reflectOnFailure(task, journal, steps.map(describeStep), i, step, observation, signal);
-      } catch (error) {
-        if (signal.aborted) throw error;
-        logger.warning('reflect call failed:', error);
-        replanReason = `reflection failed after a step failure: ${observation.slice(0, 160)}`;
-        break;
-      }
-      const reflectMeta = track(reflectCall.usage);
-      const reflect = reflectCall.result;
-      logger.info('reflect:', JSON.stringify(reflect).slice(0, 300));
-      note(`reflect: ${reflect.verdict}${reflect.reason ? ` — ${reflect.reason.slice(0, 160)}` : ''}`);
+      let fixes = 0;
+      let replanReason: string | null = null;
+      let stopped = false;
+      const planStart = Date.now();
 
-      if (reflect.verdict === 'fix_step' && reflect.step) {
-        // Conductor guard: a side-effect action may have landed — a "fix"
-        // that repeats the same kind of action is not allowed
-        const repeatsSideEffect = step.sideEffect && reflect.step.do === step.do;
-        const fixValid = !STATE_CHANGING.has(reflect.step.do) || hasExpectation(reflect.step.expect);
-        if (!repeatsSideEffect && fixValid) {
-          fixes++;
-          (reflect.step as { _fixed?: boolean })._fixed = true;
-          steps[i] = reflect.step;
+      let i = 0;
+      while (i < steps.length) {
+        if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+        if (outOfTime()) break;
+        const step = steps[i];
+        const stepLabel = `Step ${i + 1}/${steps.length}: ${describeStep(step)}`;
+        const wasFixed = Boolean((step as { _fixed?: boolean })._fixed);
+
+        // Quality-gate the data the moment before it is written to the document
+        if (step.textFrom === 'collected') await curateBeforeWrite('');
+
+        // Execute + verify, with one silent retry for flakes. Side-effect steps
+        // get exactly ONE attempt — retrying a possibly-landed post/send is the
+        // one mistake this architecture must never make (enforced here, not in
+        // a prompt).
+        const attempts = step.sideEffect ? 1 : 2;
+        let observation = '';
+        let passed = false;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          const exec = await runner.execStep(step);
+          if (!exec.ok) {
+            observation = exec.message;
+          } else if (hasExpectation(step.expect)) {
+            const verdict = await verifyExpect(tabId, step.expect!, signal);
+            if (verdict.pass) {
+              passed = true;
+              observation = verdict.observation;
+            } else {
+              observation = verdict.observation;
+            }
+          } else {
+            passed = true;
+            observation = exec.message;
+          }
+          if (passed) break;
+          if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, 1200));
+        }
+
+        if (passed) {
           postExecutionEvent(
             port,
             Actors.SYSTEM,
             'step.ok',
             taskId,
-            `Corrected step ${i + 1}: ${describeStep(reflect.step)}${reflect.reason ? ` (${reflect.reason.slice(0, 120)})` : ''}`,
-            reflectMeta,
+            `${stepLabel} ✓${hasExpectation(step.expect) ? ` (${describeExpect(step.expect!)})` : ''}`,
+            '⚙ verified · $0',
           );
+          note(
+            `step ${i + 1} ok: ${describeStep(step)}${observation && observation !== 'expect met' ? ` — ${observation.slice(0, 120)}` : ''}`,
+          );
+          // Checkpoint the accumulated knowledge after each verified step so a
+          // stall here can resume with everything up to this point
+          await persist('running');
+          i++;
           continue;
         }
-        replanReason = repeatsSideEffect
-          ? 'a side-effect step failed verification and must not be repeated blindly'
-          : 'the corrected step was missing an expect';
-        note(`fix rejected by the runtime: ${replanReason}`);
+
+        // ---- REFLECT ----
+        postExecutionEvent(
+          port,
+          Actors.SYSTEM,
+          'step.ok',
+          taskId,
+          `${stepLabel} ✗ — ${observation.slice(0, 160)}`,
+          '⚙ verify failed',
+        );
+        note(`step ${i + 1} FAILED: ${describeStep(step)} — ${observation.slice(0, 180)}`);
+
+        // A step that was already corrected once and failed again means the
+        // reflector is guessing — force a replan instead of more surgery
+        if (wasFixed || fixes >= MAX_FIXES_PER_PLAN) {
+          replanReason = wasFixed
+            ? `the corrected step also failed: ${observation.slice(0, 160)}`
+            : `too many step corrections in this plan (${fixes})`;
+          note(`forcing replan: ${replanReason}`);
+          break;
+        }
+
+        let reflectCall;
+        try {
+          reflectCall = await reflectOnFailure(
+            goalText,
+            journal,
+            steps.map(describeStep),
+            i,
+            step,
+            observation,
+            signal,
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          logger.warning('reflect call failed:', error);
+          replanReason = `reflection failed after a step failure: ${observation.slice(0, 160)}`;
+          break;
+        }
+        const reflectMeta = track(reflectCall.usage);
+        const reflect = reflectCall.result;
+        logger.info('reflect:', JSON.stringify(reflect).slice(0, 300));
+        note(`reflect: ${reflect.verdict}${reflect.reason ? ` — ${reflect.reason.slice(0, 160)}` : ''}`);
+
+        if (reflect.verdict === 'fix_step' && reflect.step) {
+          // Conductor guard: a side-effect action may have landed — a "fix"
+          // that repeats the same kind of action is not allowed
+          const repeatsSideEffect = step.sideEffect && reflect.step.do === step.do;
+          const fixValid = !STATE_CHANGING.has(reflect.step.do) || hasExpectation(reflect.step.expect);
+          if (!repeatsSideEffect && fixValid) {
+            fixes++;
+            (reflect.step as { _fixed?: boolean })._fixed = true;
+            steps[i] = reflect.step;
+            postExecutionEvent(
+              port,
+              Actors.SYSTEM,
+              'step.ok',
+              taskId,
+              `Corrected step ${i + 1}: ${describeStep(reflect.step)}${reflect.reason ? ` (${reflect.reason.slice(0, 120)})` : ''}`,
+              reflectMeta,
+            );
+            continue;
+          }
+          replanReason = repeatsSideEffect
+            ? 'a side-effect step failed verification and must not be repeated blindly'
+            : 'the corrected step was missing an expect';
+          note(`fix rejected by the runtime: ${replanReason}`);
+          break;
+        }
+        if (reflect.verdict === 'replan') {
+          replanReason = reflect.reason || 'the reflector requested a new plan';
+          break;
+        }
+        // stop
+        stopped = true;
+        replanReason = reflect.reason || 'the reflector stopped the run';
         break;
       }
-      if (reflect.verdict === 'replan') {
-        replanReason = reflect.reason || 'the reflector requested a new plan';
-        break;
+
+      trajectoryStore
+        .appendSubtask({
+          id: planId,
+          sessionId: taskId,
+          taskRecordId: record.id,
+          goal: `plan ${plansUsed}: ${task.slice(0, 140)}`,
+          success: objective.map(describeExpect).join(' & '),
+          status: replanReason === null ? 'ok' : 'fail',
+          summary: replanReason ?? `all ${steps.length} steps passed verification`,
+          stepsCount: steps.length,
+          plannedBy: 'orchestrator',
+          plannerTier: 0,
+          plannerModel: 'pav',
+          startedAt: planStart,
+          endedAt: Date.now(),
+        })
+        .catch(error => logger.warning('plan record failed:', error));
+
+      if (stopped) {
+        await report('partial', `Stopped: ${replanReason}`);
+        return;
       }
-      // stop
-      stopped = true;
-      replanReason = reflect.reason || 'the reflector stopped the run';
-      break;
-    }
-
-    trajectoryStore
-      .appendSubtask({
-        id: planId,
-        sessionId: taskId,
-        taskRecordId: record.id,
-        goal: `plan ${plansUsed}: ${task.slice(0, 140)}`,
-        success: objective.map(describeExpect).join(' & '),
-        status: replanReason === null ? 'ok' : 'fail',
-        summary: replanReason ?? `all ${steps.length} steps passed verification`,
-        stepsCount: steps.length,
-        plannedBy: 'orchestrator',
-        plannerTier: 0,
-        plannerModel: 'pav',
-        startedAt: planStart,
-        endedAt: Date.now(),
-      })
-      .catch(error => logger.warning('plan record failed:', error));
-
-    if (stopped) {
-      await report('partial', `Stopped: ${replanReason}`);
-      return;
-    }
-    if (replanReason !== null) {
-      note(`plan ${plansUsed} abandoned: ${replanReason}`);
-      continue;
-    }
-    if (outOfTime()) {
-      await report('partial', `Time budget (${Math.round(MAX_TASK_MS / 60000)} min) exhausted mid-plan.`);
-      return;
-    }
-
-    // ---- VERIFY OBJECTIVE ----
-    if (objective.length === 0) {
-      // The planner defined no objective checks — steps all verified, accept
-      note('all steps passed; the plan declared no objective expects');
-      await report('achieved', '');
-      return;
-    }
-    let objectiveMet = true;
-    for (const expect of objective) {
-      const verdict = await verifyExpect(tabId, expect, signal);
-      postExecutionEvent(
-        port,
-        Actors.SYSTEM,
-        'step.ok',
-        taskId,
-        `Objective check ${verdict.pass ? '✓' : '✗'} ${describeExpect(expect)}${verdict.pass ? '' : ` — ${verdict.observation.slice(0, 140)}`}`,
-        '⚙ verified · $0',
-      );
-      if (!verdict.pass) {
-        objectiveMet = false;
-        note(`objective check FAILED: ${describeExpect(expect)} — ${verdict.observation.slice(0, 180)}`);
-        break;
+      if (replanReason !== null) {
+        note(`plan ${plansUsed} abandoned: ${replanReason}`);
+        continue;
       }
+      if (outOfTime()) {
+        await report('partial', `Time budget (${Math.round(MAX_TASK_MS / 60000)} min) exhausted mid-plan.`);
+        return;
+      }
+
+      // ---- VERIFY OBJECTIVE ----
+      if (objective.length === 0) {
+        // The planner defined no objective checks — steps all verified, accept
+        note('all steps passed; the plan declared no objective expects');
+        await report('achieved', '');
+        return;
+      }
+      let objectiveMet = true;
+      for (const expect of objective) {
+        const verdict = await verifyExpect(tabId, expect, signal);
+        postExecutionEvent(
+          port,
+          Actors.SYSTEM,
+          'step.ok',
+          taskId,
+          `Objective check ${verdict.pass ? '✓' : '✗'} ${describeExpect(expect)}${verdict.pass ? '' : ` — ${verdict.observation.slice(0, 140)}`}`,
+          '⚙ verified · $0',
+        );
+        if (!verdict.pass) {
+          objectiveMet = false;
+          note(`objective check FAILED: ${describeExpect(expect)} — ${verdict.observation.slice(0, 180)}`);
+          break;
+        }
+      }
+      if (objectiveMet) {
+        note('all objective checks passed');
+        await report('achieved', '');
+        return;
+      }
+      // Objective not met — plan again with the journal explaining why
     }
-    if (objectiveMet) {
-      note('all objective checks passed');
-      await report('achieved', '');
-      return;
-    }
-    // Objective not met — plan again with the journal explaining why
+
+    await report('partial', `Plan budget (${MAX_PLANS}) exhausted without meeting the objective.`);
+  } catch (error) {
+    // Cancel, timeout, or an unexpected throw — leave the run RESUMABLE so the
+    // user can pick up where it stalled instead of starting over
+    await persist('stalled').catch(() => {});
+    throw error;
   }
-
-  await report('partial', `Plan budget (${MAX_PLANS}) exhausted without meeting the objective.`);
 }
