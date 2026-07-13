@@ -340,8 +340,29 @@ export function createStepRunner(
         const state = await perceive();
         if (!state) return { ok: false, message: 'could not read the page to locate the input' };
         const index = resolveTarget(state, step.target);
-        if (index === null) return { ok: false, message: `no input element matching "${step.target}"` };
-        return executeAction(tabId, taskId, { type: 'type', index, text }, state, logContextFor(step));
+        if (index !== null) {
+          return executeAction(tabId, taskId, { type: 'type', index, text }, state, logContextFor(step));
+        }
+        // Vision fallback — the same ladder click has. Rich/contenteditable
+        // composers often expose no matchable label: ground the field on the
+        // screenshot, click to focus it, then type as trusted keyboard input.
+        try {
+          const point = await groundTarget(tabId, step.target, signal);
+          const focus = await executeAction(
+            tabId,
+            taskId,
+            { type: 'click_at', x: point.x, y: point.y, target: point.target },
+            state,
+            logContextFor(step),
+          );
+          if (!focus.ok) return { ok: false, message: `could not focus "${step.target}": ${focus.message}` };
+          await sleep(400);
+          return executeAction(tabId, taskId, { type: 'type_focused', text }, lastState, logContextFor(step));
+        } catch (error) {
+          if (signal.aborted) throw error;
+          const message = error instanceof Error ? error.message : String(error);
+          return { ok: false, message: `no input element matching "${step.target}" (vision fallback: ${message})` };
+        }
       }
       case 'extract': {
         if (!step.query) return { ok: false, message: 'extract step has no query' };

@@ -111,8 +111,8 @@ export interface ReflectResult {
 const STEP_FORMS = `Step forms (the runtime executes these EXACTLY — put real values in, never placeholders):
 {"do":"navigate","url":"https://..."}
 {"do":"click","target":"<visible label of the element, e.g. Start a post>"}
-{"do":"type","target":"<label/placeholder of the input>","text":"..."}  (replaces the input's content)
-{"do":"type_focused","text":"line1\\nline2"}  (trusted keyboard input into whatever has focus — the ONLY way to type into canvas editors like Google Docs/Sheets; they focus themselves when opened)
+{"do":"type","target":"<label/placeholder of the input>","text":"..."}  (replaces the input's content; if no labeled input matches, the runtime visually locates the field, focuses it, and types)
+{"do":"type_focused","text":"line1\\nline2"}  (trusted keyboard input into whatever currently has focus — the way to type into any RICH EDITOR that is not a plain form field: canvas editors like Google Docs/Sheets, and contenteditable composers like post/message boxes. Focus it first — click it, or it focuses itself when opened)
 {"do":"key","combo":"Enter"}  (submit a search box after typing into it)
 {"do":"scroll","direction":"down","times":2}
 {"do":"extract","query":"<what to read from the page text>"}  (a local reader answers from page text; list items are stored in the collection)
