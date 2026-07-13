@@ -62,7 +62,9 @@ const manifest = withOperaSidebar(
     description: '__MSG_app_metadata_description__',
     // <all_urls> is required for perception/actions on arbitrary pages (Phase 2+)
     host_permissions: ['http://localhost/*', 'http://127.0.0.1/*', '<all_urls>'],
-    permissions: ['storage', 'tabs', 'activeTab', 'scripting', 'unlimitedStorage'],
+    // debugger: CDP escape hatch for trusted keyboard input — canvas editors
+    // (Google Docs/Sheets) ignore synthetic key events (Phase 6, DESIGN.md)
+    permissions: ['storage', 'tabs', 'activeTab', 'scripting', 'unlimitedStorage', 'debugger'],
     options_page: 'options/index.html',
     background: {
       service_worker: 'background.iife.js',

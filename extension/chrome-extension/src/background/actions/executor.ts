@@ -2,7 +2,8 @@ import type { Action, PerceptionSnapshot } from '@extension/storage';
 import { trajectoryStore } from '@extension/storage';
 import { createLogger } from '../log';
 import { getLastSnapshot, runInPage } from '../perception';
-import { clickElementByIndex, clickAtPoint, typeIntoElement, scrollPage } from '../perception/pageScript';
+import { clickElementByIndex, clickAtPoint, typeIntoElement, scrollPage, pressKey } from '../perception/pageScript';
+import { cdpKey, cdpTypeFocused } from './cdp';
 
 const logger = createLogger('executor');
 
@@ -59,6 +60,28 @@ async function performAction(tabId: number, action: Action): Promise<ActionResul
       await sleep(300);
       return { ok: true, message: `Scrolled ${action.direction}` };
     }
+    case 'key': {
+      // Trusted CDP input first (works everywhere, incl. canvas editors);
+      // synthetic DOM events as fallback if the debugger cannot attach
+      try {
+        await cdpKey(tabId, action.combo);
+      } catch (error) {
+        logger.warning('CDP key failed, falling back to synthetic:', error);
+        const result = await runInPage(tabId, pressKey, action.combo);
+        if (!result?.ok) return { ok: false, message: result?.error ?? 'Key press failed' };
+      }
+      // Enter often submits/navigates — give the page time to react
+      await sleep(POST_ACTION_DELAY_MS);
+      await waitForTabLoad(tabId);
+      return { ok: true, message: `Pressed ${action.combo}` };
+    }
+    case 'type_focused': {
+      // CDP-only: this action exists precisely for surfaces where synthetic
+      // events do nothing (Google Docs/Sheets canvas editors)
+      await cdpTypeFocused(tabId, action.text);
+      await sleep(POST_ACTION_DELAY_MS);
+      return { ok: true, message: `Typed ${action.text.split('\n').length} line(s) into the focused editor` };
+    }
     case 'navigate': {
       const url = /^[a-z]+:\/\//i.test(action.url) ? action.url : `https://${action.url}`;
       await chrome.tabs.update(tabId, { url });
@@ -71,6 +94,11 @@ async function performAction(tabId: number, action: Action): Promise<ActionResul
       await sleep(POST_ACTION_DELAY_MS);
       await waitForTabLoad(tabId);
       return { ok: true, message: 'Went back' };
+    }
+    case 'extract': {
+      // The agent loop performs extraction (it needs an LLM call over the
+      // page text) and logs the step itself; nothing to do in the page
+      return { ok: true, message: `Extract: ${action.query}` };
     }
     case 'done': {
       return { ok: true, message: action.message };
