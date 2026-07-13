@@ -1,40 +1,34 @@
 import type { PerceptionSnapshot } from '@extension/storage';
-import { Actors, trajectoryStore } from '@extension/storage';
+import { trajectoryStore } from '@extension/storage';
 import { createLogger } from '../log';
-import { postExecutionEvent } from '../events';
 import { capturePageState, capturePageText } from '../perception';
 import { executeAction } from '../actions/executor';
 import { extractFromPage, LOCAL_ENDPOINT } from './planner';
 import { groundTarget, verifyVisual } from './grounder';
 import type { ProgramStep } from './orchestrator';
-import type { SubtaskRunResult } from './loop';
 
 const logger = createLogger('program');
 
 /**
- * Deterministic program runner — the "harness as runtime" half of the
- * compiler architecture. The cloud orchestrator emits subtasks as typed
- * steps; this module executes them directly, with NO local planner in
- * between (the 4B model reinterpreting explicit instructions was the root
- * cause of most failures). Local models are used only as senses:
+ * Deterministic step engine — the "harness as runtime" half of the
+ * architecture. The cloud planner emits typed steps; this module executes
+ * them exactly as written, with NO model in between. Local models are used
+ * only as senses:
  *  - resolveTarget: description -> element index (deterministic label match)
  *  - Holo grounding: vision fallback when the DOM match fails (clicks only)
  *  - extractFromPage: reading data out of the page text
+ *  - verifyVisual: answering questions from a screenshot
  */
 
-const MAX_PROGRAM_STEPS = 15;
-const STEP_RETRIES = 2;
 const HARVEST_DEFAULT_MAX_SCROLLS = 6;
 const HARVEST_NO_CHANGE_LIMIT = 2;
-const MAX_EXTRACT_SUMMARY_CHARS = 600;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-export interface ProgramContext {
-  taskRecordId: string;
-  success: string;
-  stepPrefix: string;
-  /** Receives every extract result, for the task-level data ledger */
+export interface StepRunnerContext {
+  /** Groups this run's trajectory step logs (the plan id) */
+  runId: string;
+  /** Receives every extract result, for the journal and collection store */
   onExtract?: (query: string, answer: string) => void;
   /** Live view of already-collected data, so extracts report only NEW items */
   knownData?: () => string[];
@@ -46,13 +40,10 @@ export interface ProgramContext {
   collectedItems?: () => string[];
 }
 
-function elementsDigestOf(state: PerceptionSnapshot | null): string[] {
-  if (!state) return [];
-  return state.elements.slice(0, 60).map(el => {
-    const kind = el.role && el.role !== el.tag ? `${el.tag}:${el.role}` : el.tag;
-    const label = (el.text || el.placeholder || el.href || '').slice(0, 60);
-    return `[${el.index}]<${kind}> ${label}`.trim();
-  });
+export interface StepRunner {
+  execStep: (step: ProgramStep) => Promise<{ ok: boolean; message: string }>;
+  perceive: () => Promise<PerceptionSnapshot | null>;
+  getState: () => PerceptionSnapshot | null;
 }
 
 function normalizeLabel(text: string): string {
@@ -98,7 +89,7 @@ export function resolveTarget(state: PerceptionSnapshot, target: string): number
   return bestScore >= 0.45 ? bestIndex : null;
 }
 
-function describeStep(step: ProgramStep): string {
+export function describeStep(step: ProgramStep): string {
   switch (step.do) {
     case 'navigate':
       return `navigate to ${step.url}`;
@@ -159,57 +150,17 @@ function pageSignature(state: PerceptionSnapshot | null): string {
 }
 
 /**
- * Execute one program subtask. Steps run exactly as written; a step gets one
- * retry (after a beat, with fresh perception), then the subtask fails and the
- * normal rescue/checkpoint machinery takes over.
+ * Create the step engine for one plan run. Steps execute exactly as written;
+ * retries, verification, and reflection are the conductor's job.
  */
-export async function runProgramSubtask(
-  port: chrome.runtime.Port,
+export function createStepRunner(
   tabId: number,
   taskId: string,
-  goal: string,
-  steps: ProgramStep[],
-  ctx: ProgramContext,
+  ctx: StepRunnerContext,
   signal: AbortSignal,
-): Promise<SubtaskRunResult> {
-  const subtaskId = crypto.randomUUID();
-  const startedAt = Date.now();
-  const history: string[] = [];
-  const collected: string[] = [];
+): StepRunner {
   let lastState: PerceptionSnapshot | null = null;
-  let stepsCount = 0;
-  const meta = '⚙ program (deterministic) · $0';
-
-  const finalize = async (status: 'ok' | 'fail', summary: string): Promise<SubtaskRunResult> => {
-    // Evidence for the checkpoint: the page as the program left it
-    lastState = await capturePageState(tabId, false).catch(() => lastState);
-    await trajectoryStore
-      .appendSubtask({
-        id: subtaskId,
-        sessionId: taskId,
-        taskRecordId: ctx.taskRecordId,
-        goal,
-        success: ctx.success,
-        status,
-        summary,
-        stepsCount,
-        plannedBy: 'orchestrator',
-        plannerTier: 0,
-        plannerModel: 'program',
-        startedAt,
-        endedAt: Date.now(),
-      })
-      .catch(error => logger.warning('subtask record failed:', error));
-    return {
-      status,
-      summary,
-      actions: history.slice(-6),
-      url: lastState?.url,
-      title: lastState?.title,
-      elementsDigest: elementsDigestOf(lastState),
-      pageTextExcerpt: lastState?.pageText?.slice(0, 800),
-    };
-  };
+  const history: string[] = [];
 
   const perceive = async (): Promise<PerceptionSnapshot | null> => {
     const state = await capturePageState(tabId, false).catch(async () => {
@@ -221,7 +172,7 @@ export async function runProgramSubtask(
   };
 
   const logContextFor = (step: ProgramStep) => ({
-    subtaskId,
+    subtaskId: ctx.runId,
     decision: step,
     plannerModel: 'program',
     plannerTier: 0,
@@ -230,10 +181,8 @@ export async function runProgramSubtask(
 
   // Run one extract (ledger- and dedup-aware); returns new-item count.
   // With `seen` (harvest mode) the HARNESS deduplicates: the local reader
-  // re-reports items that stay in view across scrolls (its NOTHING-NEW check
-  // sees only a truncated ledger window), so only never-seen lines count
-  // toward the target — and only they reach the ledger, keeping checkpoint
-  // payloads free of duplicates.
+  // re-reports items that stay in view across scrolls, so only never-seen
+  // lines count toward the target — and only they reach the journal.
   const runExtract = async (query: string, seen?: Set<string>): Promise<{ newItems: number; note: string }> => {
     const pageText = await capturePageText(tabId).catch(() => lastState?.pageText ?? '');
     const { answer } = await extractFromPage(query, pageText, signal, LOCAL_ENDPOINT, ctx.knownData?.() ?? []);
@@ -262,7 +211,6 @@ export async function runProgramSubtask(
       }
     }
     ctx.onExtract?.(query, reported);
-    collected.push(reported.slice(0, MAX_EXTRACT_SUMMARY_CHARS));
     if (lastState) {
       trajectoryStore
         .appendStep({
@@ -291,6 +239,12 @@ export async function runProgramSubtask(
   };
 
   const execStep = async (step: ProgramStep): Promise<{ ok: boolean; message: string }> => {
+    const result = await execStepInner(step);
+    history.push(`${describeStep(step)} -> ${result.ok ? result.message || 'ok' : `FAILED: ${result.message}`}`);
+    return result;
+  };
+
+  const execStepInner = async (step: ProgramStep): Promise<{ ok: boolean; message: string }> => {
     switch (step.do) {
       case 'navigate':
         if (!step.url) return { ok: false, message: 'navigate step has no url' };
@@ -391,7 +345,6 @@ export async function runProgramSubtask(
         if (!step.question) return { ok: false, message: 'verify_visual step has no question' };
         // Local VLM reads the screenshot; only the verdict leaves the machine
         const answer = await verifyVisual(tabId, step.question, signal);
-        collected.push(`visual check "${step.question.slice(0, 80)}": ${answer.slice(0, 300)}`);
         return { ok: true, message: answer.slice(0, 200) };
       }
       case 'harvest': {
@@ -422,14 +375,13 @@ export async function runProgramSubtask(
           }
           lastSig = sig;
         }
-        // Zero yield is a FAILURE, not a completed collection: it routes to
-        // the rescue ladder (per-subtask budget) instead of costing the
-        // checkpoint a scarce replan to notice the emptiness
+        // Zero yield is a FAILURE, not a completed collection — the reflector
+        // gets to decide whether the page or the query was the problem
         if (total === 0) {
           return {
             ok: false,
             message:
-              'harvest collected 0 items — the results may not have rendered yet (add wait_for before harvesting) or the query matched nothing on this page',
+              'harvest collected 0 items — the results may not have rendered yet or the query matched nothing on this page',
           };
         }
         return { ok: true, message: `collected ${total} unique items (results stopped yielding new ones)` };
@@ -439,37 +391,5 @@ export async function runProgramSubtask(
     }
   };
 
-  try {
-    for (const [i, step] of steps.slice(0, MAX_PROGRAM_STEPS).entries()) {
-      if (signal.aborted) throw new DOMException('aborted', 'AbortError');
-      stepsCount++;
-      let result = { ok: false, message: 'not run' };
-      for (let attempt = 1; attempt <= STEP_RETRIES; attempt++) {
-        result = await execStep(step);
-        if (result.ok) break;
-        if (attempt < STEP_RETRIES) await sleep(1200);
-      }
-      history.push(`${describeStep(step)} -> ${result.ok ? result.message || 'ok' : `FAILED: ${result.message}`}`);
-      postExecutionEvent(
-        port,
-        Actors.SYSTEM,
-        'step.ok',
-        taskId,
-        `${ctx.stepPrefix}Step ${i + 1}: ${describeStep(step)}${result.ok ? '' : ` — FAILED: ${result.message.slice(0, 120)}`}`,
-        meta,
-      );
-      if (!result.ok) {
-        return await finalize(
-          'fail',
-          `Program step ${i + 1} of ${steps.length} failed — ${describeStep(step)}: ${result.message}`,
-        );
-      }
-    }
-    const dataNote = collected.length ? ` Collected data:\n${collected.slice(-4).join('\n').slice(0, 1200)}` : '';
-    return await finalize('ok', `All ${Math.min(steps.length, MAX_PROGRAM_STEPS)} program steps completed.${dataNote}`);
-  } catch (error) {
-    if (signal.aborted) throw error;
-    const message = error instanceof Error ? error.message : String(error);
-    return await finalize('fail', `Program crashed at step ${stepsCount}: ${message}`);
-  }
+  return { execStep, perceive, getState: () => lastState };
 }

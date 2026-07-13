@@ -4,21 +4,39 @@ import { createLogger } from '../log';
 const logger = createLogger('orchestrator');
 
 /**
- * Cloud orchestrator: a strong model that triages tasks, decomposes them into
- * subtasks for the local executor, checkpoints progress, and produces the
- * final validated answer.
+ * Cloud planner/reflector for the plan–act–verify architecture. One strong
+ * model (GLM 5.2 by default) makes every decision through exactly three
+ * prompts: PLAN (objective -> steps with expects), REFLECT (failed step ->
+ * fix/replan/stop), REPORT (journal -> final answer). Local models only
+ * perceive: grounding, extraction, and visual verification.
  *
  * HARD RULE: payloads are digest-only. This module has no access to
- * screenshots by construction — only the task text, plan state, structured
- * subtask outcome summaries, and element-label digests (at triage and on
- * rescue) cross the boundary. Page-text excerpts cross only where the
- * cloud-executor gate is open. Collected datasets are written to pages via
+ * screenshots by construction — the objective, the journal, page digests
+ * (URL/title/element labels), and verifier observations are the only things
+ * that cross the boundary. Collected datasets are written to pages via
  * textFrom:"collected" WITHOUT crossing the boundary at all.
  */
 
 /**
- * One typed step of an orchestrator-authored program. The harness executes
- * steps deterministically — no local planner in between. Targets are element
+ * Observable postcondition, verified against the LIVE page by the harness.
+ * url/text/element are deterministic checks (instant, polled while the page
+ * settles); `see` is a local-VLM screenshot question for what only pixels can
+ * answer. All specified fields must hold.
+ */
+export interface StepExpect {
+  /** Substring the page URL must contain */
+  url?: string;
+  /** Text that must appear in the readable page text */
+  text?: string;
+  /** Label of an interactive element that must exist */
+  element?: string;
+  /** Yes/no question for the local vision verifier (canvas editors, layout) */
+  see?: string;
+}
+
+/**
+ * One typed step of a planner-authored program. The harness executes steps
+ * deterministically — no model interprets them. Targets are element
  * DESCRIPTIONS (visible labels), resolved on-page by label matching with a
  * vision-grounding fallback.
  */
@@ -58,168 +76,88 @@ export interface ProgramStep {
   times?: number;
   /** wait: delay; wait_for: timeout (default 10000, max 20000) */
   ms?: number;
+  /** Postcondition verified after the step; REQUIRED on state-changing steps */
+  expect?: StepExpect;
+  /** Posts/sends/submits/purchases/deletes — never auto-retried */
+  sideEffect?: boolean;
 }
 
-export interface Subtask {
-  goal: string;
-  /** How the checkpoint judges whether this subtask succeeded */
-  success: string;
-  /**
-   * The program: exact steps the harness executes deterministically. When
-   * present, no local model interprets the goal. Omitted only for genuinely
-   * open-ended work (a small local model then improvises — unreliable).
-   */
-  steps?: ProgramStep[];
-  /**
-   * Legacy: goal-only subtask that is exactly ONE browser action — the loop
-   * performs the first successful action and stops. Superseded by steps.
-   */
-  atomic?: boolean;
-}
-
-export interface SubtaskOutcome {
-  goal: string;
-  status: 'ok' | 'fail';
-  /** The local loop's final message or failure reason */
-  summary: string;
-  /** Last few action->result lines from the local loop */
-  actions: string[];
-  url?: string;
-  title?: string;
-  /**
-   * Post-subtask page evidence for the checkpoint: interactive-element labels
-   * (and optionally a page-text excerpt when the cloud-executor boundary is
-   * open). Sent only for the most recent outcome to keep payloads lean.
-   */
-  evidence?: string[];
-  pageTextExcerpt?: string;
-}
-
-export interface TriageResult {
-  mode: 'chat' | 'execute' | 'plan' | 'recipe';
-  /** Direct answer for mode=chat */
+export interface PlanResult {
+  mode: 'chat' | 'plan';
+  /** Unused for chat (the reply is streamed separately with history) */
   reply?: string;
-  /** Ordered subtasks for mode=plan */
-  subtasks?: Subtask[];
-  /** Matched recipe for mode=recipe */
-  recipeId?: string;
-  /** Values for the recipe's declared params, filled from the task */
-  params?: Record<string, string>;
-}
-
-/**
- * What the parameterize call returns after a successful cold run: the
- * executed plan with task-specific literals replaced by {param} placeholders,
- * ready to store as a recipe (or save=false for one-off tasks).
- */
-export interface RecipeCandidate {
-  save: boolean;
-  /** Kebab-case handle, e.g. "post-to-linkedin" */
-  name?: string;
-  /** Primary site, e.g. "linkedin.com" */
-  site?: string;
-  /** One-line description of what the recipe accomplishes */
-  intent?: string;
-  params?: { name: string; description: string }[];
-  subtasks?: Subtask[];
-}
-
-export interface CheckpointResult {
-  decision: 'continue' | 'replan' | 'done' | 'fail';
-  /** Final user-facing answer for decision=done */
-  answer?: string;
-  reason?: string;
-  /** Remaining subtasks for decision=replan */
-  subtasks?: Subtask[];
-}
-
-export interface RescueResult {
-  decision: 'retry' | 'replan' | 'fail';
-  /** Corrected, more concrete goal for decision=retry */
-  revisedGoal?: string;
-  revisedSuccess?: string;
-  /** Corrected program for decision=retry — executed deterministically */
+  /** The complete program for mode=plan */
   steps?: ProgramStep[];
-  reason?: string;
-  /** Remaining subtasks for decision=replan */
-  subtasks?: Subtask[];
+  /** 1-4 expects that define success of the WHOLE objective */
+  objective?: StepExpect[];
 }
 
-// Shared step-forms reference for every prompt that authors programs
-const STEP_FORMS = `Each subtask should include "steps": an exact program the browser runtime executes deterministically — no model interprets it, so put REAL values in. Step forms:
+export interface ReflectResult {
+  verdict: 'fix_step' | 'replan' | 'stop';
+  /** Corrected step (with expect) for verdict=fix_step */
+  step?: ProgramStep;
+  reason?: string;
+}
+
+// Shared step-forms reference for PLAN and REFLECT
+const STEP_FORMS = `Step forms (the runtime executes these EXACTLY — put real values in, never placeholders):
 {"do":"navigate","url":"https://..."}
 {"do":"click","target":"<visible label of the element, e.g. Start a post>"}
 {"do":"type","target":"<label/placeholder of the input>","text":"..."}  (replaces the input's content)
 {"do":"type_focused","text":"line1\\nline2"}  (trusted keyboard input into whatever has focus — the ONLY way to type into canvas editors like Google Docs/Sheets; they focus themselves when opened)
 {"do":"key","combo":"Enter"}  (submit a search box after typing into it)
 {"do":"scroll","direction":"down","times":2}
-{"do":"extract","query":"<what to read from the page text>"}  (a local reader answers from page text; results accumulate in the task's data ledger)
-{"do":"harvest","query":"<items to collect>","until":10}  (scroll+extract loop until ~N unique items are collected or results stop loading — USE THIS for any collect-N-things-from-a-feed work. Unique items are counted and deduplicated by the runtime; a harvest that collects 0 items FAILS the subtask)
-{"do":"verify_visual","question":"<yes/no question about what is visible on screen>"}  (a local vision model answers from a screenshot — the ONLY way to verify content inside canvas editors, since text extraction cannot see it; e.g. "Does the document body show a list titled 'Top 5 Voices'?")
-{"do":"wait_for","target":"<text that must appear on the page>","ms":10000}  (poll until the text appears, then continue; fails after the timeout. ALWAYS use this instead of a blind wait after navigating to a page whose content you will read or act on — e.g. after opening search results, wait_for a word you expect in them)
-{"do":"wait","ms":1500}  (blind delay — last resort when there is no known text to wait for)
+{"do":"extract","query":"<what to read from the page text>"}  (a local reader answers from page text; list items are stored in the collection)
+{"do":"harvest","query":"<items to collect>","until":10}  (scroll+extract loop until ~N unique items are collected or results stop yielding — USE THIS for any collect-N-things-from-a-feed work; the runtime deduplicates; 0 items fails the step)
+{"do":"wait_for","target":"<text that must appear>","ms":10000}  (poll until the text appears; rarely needed — expects already wait)
+{"do":"wait","ms":1500}  (blind delay — last resort)
+Targets are element DESCRIPTIONS (visible text labels), resolved on the live page by label matching with a vision fallback — never invent element indices.
 
-WRITING COLLECTED DATA: any type/type_focused step may use "textFrom":"collected" instead of composing the data into "text". The runtime inserts EVERY item the task has harvested/extracted so far, complete and verbatim, below the optional "text" (which becomes a header line, e.g. column headers). This is the ONLY reliable way to write a collected dataset — the ledger digests you see are truncated, so never paste them into "text" yourself. Because items are inserted verbatim, harvest queries for data that will be written somewhere must ask for each item ALREADY FORMATTED as it should appear (e.g. "format each record as: Name<TAB>Title<TAB>Company").
-Targets are element DESCRIPTIONS (visible text labels), resolved on the live page by label matching with a vision fallback — never invent element indices. A step that fails stops the subtask and comes back to you with the page state. Omit "steps" (goal-only subtask) ONLY when the work genuinely needs on-page judgment; a small unreliable local model then improvises it — strongly prefer steps.
+EXPECTS — every state-changing step (navigate, click, type, type_focused, key) MUST carry "expect", the observable postcondition that proves the step worked:
+"expect": {"url": "<substring the URL will contain>"}
+"expect": {"text": "<text that will appear on the page>"}
+"expect": {"element": "<label of an element that will exist>"}
+"expect": {"see": "<yes/no question for a local vision model>"}
+Fields combine (all must hold). Prefer url/text/element — they are checked instantly against the live page and POLL for up to ~8 seconds, so you never need wait steps after navigation: the expect IS the wait. Use "see" ONLY for canvas editors (Google Docs/Sheets, where page text cannot see the document content) or purely visual outcomes — it costs a slow local vision call. Choose expects that are SPECIFIC to success: "the composer dialog closed and the feed shows the post text" beats "the page loaded". Read-only steps (extract, harvest, scroll, wait, wait_for) may omit expect.
 
-Canvas editors (Google Docs/Sheets): the editor is ALREADY FOCUSED when the document opens — go straight to type_focused. Never click menus, toolbars or mode buttons first (clicking steals focus and the keystrokes land in the wrong place); if UI state is uncertain, use {"do":"key","combo":"Escape"} before typing. Type PLAIN TEXT into documents — no markdown syntax like # or ** (WYSIWYG editors render it literally). End every canvas-write subtask with a verify_visual step that checks the typed content is visible in the document. NEVER put placeholder text (like "[to be filled]") in a typed step — compose the complete final text from the data you have; if the data is not collected yet, leave the subtask goal-only and compile it at a later checkpoint when the data exists.`;
+SIDE EFFECTS — steps that post, send, submit a form, purchase, or delete MUST carry "sideEffect": true. The runtime never auto-retries them.
 
-const TRIAGE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent that runs in a Chrome side panel. You compile the user's task into subtask PROGRAMS that a deterministic runtime executes against the user's active tab. Local models handle perception (locating described elements, reading page text) but do not make decisions. You cannot browse yourself — you may receive CURRENT PAGE: a text digest (URL, title, element labels) of the active tab as the task starts. Ground the plan in it: if the task starts on this page, act on what is actually there instead of guessing; if the page is irrelevant, plan navigation as usual.
+WRITING COLLECTED DATA: a type/type_focused step may use "textFrom":"collected" — the runtime inserts EVERY item collected so far, complete and verbatim, below the optional "text" (which becomes a header line, e.g. column headers). This is the ONLY reliable way to write a collected dataset — journal digests are truncated, so never paste them into "text" yourself. Harvest queries for data that will be written must ask for each item ALREADY FORMATTED for the destination (e.g. "format each record as: Name<TAB>Title<TAB>Company").
 
-Classify the user's request and reply ONLY with a JSON object:
-{"mode": "chat" | "execute" | "plan" | "recipe", "reply": "<answer for chat>", "subtasks": [{"goal": "...", "success": "...", "steps": [...]}], "recipeId": "<id>", "params": {"<name>": "<value>"}}
+Canvas editors (Google Docs/Sheets): the editor is ALREADY FOCUSED when the document opens — go straight to type_focused. Never click menus or toolbars first (clicking steals focus); if UI state is uncertain, use {"do":"key","combo":"Escape"} before typing. Type PLAIN TEXT — no markdown syntax. Verify canvas writes with a "see" expect (text extraction cannot see inside the canvas).`;
 
-- "chat": no browser needed (questions, conversation). Leave "reply" empty — the answer is streamed by a separate call with full conversation history.
-- "execute": ONE atomic browser action (e.g. "open site X"). Reply with a single subtask containing that one step.
-- "recipe": ONLY when a RECIPE LIBRARY section is present and one of its recipes matches the task's site AND intent. Reply with the recipe's id and EVERY declared param filled with the real value from the user's task (compose the content yourself when the task implies it, e.g. write the actual post text). A recipe is a saved program from a previous successful run — reusing it is far cheaper and more reliable than planning again, so prefer a genuine match over planning. But never force one: a different site, or the same site with a different intent, is NOT a match.
-- "plan": everything else. Decompose into 2-12 ordered subtasks. Group related steps into a subtask (e.g. one subtask = "search X and collect authors" with navigate+harvest steps); you are checkpointed after each subtask with evidence of the resulting page state.
-
-${STEP_FORMS}
-
-State each "success" criterion as an OBSERVABLE page fact (e.g. "the composer dialog is open", "the text 'hello world' appears in the editor"), never an intention. Example — "post hello world on LinkedIn" is one subtask with steps: navigate linkedin.com/feed → click "Start a post" → type "hello world" into "text editor" → click "Post". Use "type" (by target) for normal DOM inputs and editors; use "type_focused" only for canvas editors (Google Docs/Sheets) where the editing surface has no matchable label.
-
-Rules: subtasks must be self-contained. The plan must COMPLETE the user's deliverable — if the task says to save/write/add/record something, the plan must include the subtask that actually writes it (and verifies it), not just open the destination. Prefer navigating directly to known URLs (including search-results URLs) over typing into search boxes; when you do type into a search box, the next step must be {"do":"key","combo":"Enter"}. Steps that submit or send content must come AFTER the step that enters the content. Never plan logging in, paying, or handling credentials — if the task requires it, note "requires the user to be signed in" in the goal.`;
-
-const CHECKPOINT_SYSTEM_PROMPT = `You are the orchestrator for a browser agent. A small local executor just ran one subtask of your plan. You never see the page — judge from the structured outcomes.
+const PLAN_SYSTEM_PROMPT = `You are the planner for a browser agent running in a Chrome side panel. You compile the user's OBJECTIVE into a complete typed program that a deterministic runtime executes against the user's active tab, verifying every step's expect against the live page as it goes. Local models perceive (locate described elements, read page text, answer visual questions) but make no decisions. You may receive a JOURNAL — everything already tried and learned in this task, including why previous plans fell short: build on it, never repeat what it says failed.
 
 Reply ONLY with a JSON object:
-{"decision": "continue" | "replan" | "done" | "fail", "answer": "<final user answer for done>", "reason": "<short>", "subtasks": [{"goal": "...", "success": "...", "steps": [...]}]}
+{"mode": "chat" | "plan", "steps": [...], "objective": [{...expect...}]}
+
+- "chat": no browser needed (questions, conversation). The reply is streamed by a separate call.
+- "plan": the COMPLETE program to achieve the objective end to end — including the final write/save/deliver steps, max 25 steps. If the task says to save/write/post something, the plan must contain the steps that actually do it, not just open the destination.
 
 ${STEP_FORMS}
 
-- "continue": the plan is on track AND the remaining subtasks complete the user's full deliverable. If the remaining plan is missing the step that delivers (e.g. data was collected and the destination opened, but nothing writes the data), do NOT continue — replan to add it.
-- "replan": the last outcome requires CHANGING COURSE. Provide the REMAINING subtasks (same format as planning, WITH "steps" programs) that replace the rest of the plan. Do NOT re-plan work the outcomes/evidence show is already done — e.g. a search already visited and harvested should not be searched again; move to the next untried approach or the next stage of the task. Replans are BUDGETED — you are told REPLANS REMAINING. Do not spend them polishing a plan that is working: if the remaining plan is reasonable, "continue" through it even when one outcome was mediocre. The moment DATA COLLECTED is sufficient for the user's deliverable, replan DIRECTLY to the deliverable subtasks (write/save/verify) — never schedule more collection than the task needs.
+OBJECTIVE EXPECTS: "objective" is 1-4 expects that define success of the WHOLE task, verified on the live page after the last step. Make them the user's actual deliverable ("text": the sheet shows the header row; "url": the doc URL), not intermediate progress.
 
-DELIVER BEFORE THE BUDGET DIES: when REPLANS REMAINING is 1 or 0 and data has been collected, the ONLY acceptable replan is one that produces the user's deliverable with the data already in hand — never more collection. A sheet with 16 of 20 requested rows delivered is success with a caveat; 20 rows collected but never written is failure. The same logic applies at every stage: weigh "one more improvement" against the risk of delivering nothing.
-- "done": the user's TASK is fully accomplished. Write the final answer for the user in "answer", grounded ONLY in the outcome summaries and evidence — never invent facts that are not in them.
-- "fail": the task cannot be completed (explain in "reason").
+Rules: prefer navigating directly to known URLs (including search-results URLs with the query embedded) over typing into search boxes; when you do type into a search box, the next step must be {"do":"key","combo":"Enter"}. Steps that submit content come AFTER the steps that enter it. Never plan logging in or handling credentials — if the task requires being signed in, assume the user is; if a login wall appears, the run will stop and tell them. You are told PLANS USED n/N: when on the LAST plan, deliver the objective with the data already collected (a delivered partial beats an undelivered perfect).`;
 
-The most recent outcome includes "evidence": the interactive-element labels (and possibly a page text excerpt) captured AFTER it ran. Judge success against this evidence, not guesses — e.g. a closed composer dialog and a feed showing the posted text IS evidence the post succeeded.
+const REFLECT_SYSTEM_PROMPT = `You are the reflector for a browser agent. One step of the current plan failed verification (or failed to execute). You get the OBJECTIVE, the JOURNAL, the PLAN, the FAILED STEP with its expect, and the OBSERVATION — what the page or verifier actually shows. Decide whether the STEP was wrong or the PLAN is wrong.
 
-You may also receive DATA COLLECTED SO FAR: truncated digests of what the agent extracted from pages earlier in this task (the full untruncated items live in the local collection store — you are told its item count). This survives even when the subtask that gathered it failed. When enough data is already collected, do not replan its re-collection.
+Reply ONLY with a JSON object:
+{"verdict": "fix_step" | "replan" | "stop", "step": {...corrected step with expect...}, "reason": "<short diagnosis>"}
 
-DATA-WRITING SUBTASKS use "textFrom":"collected" — a type/type_focused step with it inserts the ENTIRE local collection store verbatim at execution time. NEVER compose the dataset into "text" yourself: the digests you see are truncated, so a hand-pasted list is silently incomplete. Put only header/framing text (e.g. column headers) in "text". For SHORT composed content that is not a collected dataset (a post, a message), literal "text" is still right. Never leave a data-writing subtask goal-only for the small local model to improvise — it truncates long text.
-
-CANVAS EDITORS ARE UNVERIFIABLE BY TEXT EXTRACTION: Google Docs/Sheets render content on a canvas, so page-text evidence CANNOT see what is inside the document — seeing only sidebar/placeholder text does NOT mean the document is empty. To verify a canvas write, use a {"do":"verify_visual","question":"..."} step — a local vision model reads the screenshot. When a type_focused step completed with correct focus discipline (Escape first, no menu clicks in between) and no visual verification is available, treat the write as successful with the caveat "content not verifiable by text extraction". NEVER re-type unless verify_visual gives POSITIVE evidence the content is absent — blind re-typing duplicates content.
-
-IRREVERSIBLE-ACTION RULE: if a subtask may already have performed a side-effectful action (posting, sending, submitting a form, purchasing, deleting) and you are unsure whether it took effect, NEVER replan a repeat of that action. Issue a verification-only subtask instead (e.g. "check whether the post 'hello world' appears in the feed — do NOT create a new post"). Only if verification confirms it did not happen may the action be planned again.
-
-Be strict: if an outcome does not actually contain the information or confirmation the task needs, do not declare done. When diagnosing a failure, state only causes the outcomes actually evidence — never guess at causes like "the user is not logged in" unless a summary says so. A disabled submit/post button means a required field was left empty, not a login problem.`;
-
-const RESCUE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent. The small local executor could not complete its goal: it either kept repeating an action with no effect on the page, or its actions kept failing. You get the goal it was pursuing, the actions it tried, and the interactive elements currently visible on the page (labels only — you cannot see the page itself). The executor can also "extract" — read information straight out of the page text — which usually beats clicking around for information-gathering goals. For canvas editors (Google Docs/Sheets) whose editing surface is NOT in the element list, direct it to use "type_focused": trusted keyboard input into the currently focused element (these editors focus themselves when opened).
-
-You may also receive PREVIOUS RESCUE ATTEMPTS from this task and DATA COLLECTED SO FAR. Do not repeat a correction that already failed, and do not contradict a strategy that was making progress (e.g. if extracting authors from posts was yielding names, keep going down that path rather than reverting to an approach that returned nothing). If enough data is already collected, direct the executor to move on rather than re-collect.
-
-Diagnose the real blocker and reply ONLY with a JSON object:
-{"decision": "retry" | "replan" | "fail", "revisedGoal": "<corrected concrete goal>", "revisedSuccess": "<criterion>", "steps": [...], "reason": "<short diagnosis>", "subtasks": [{"goal": "...", "success": "...", "steps": [...]}]}
+- "fix_step": the plan is right, this one action was wrong — wrong element label, wrong URL, a dialog needs dismissing first is NOT this (that changes the plan). Provide the corrected step (same intent, with expect). It replaces the failed step and the plan continues.
+- "replan": the plan's assumption about the page is false (unexpected state, the approach cannot work from here, a precondition is missing). Say why in "reason" — the planner is called again with it.
+- "stop": only the user can fix it: login required, permission prompt, CAPTCHA, or the objective is impossible.
 
 ${STEP_FORMS}
 
-- "retry": the goal was right but the approach was wrong. Provide corrected "steps" (a program, using the element labels you can see in the list) alongside the revisedGoal — the runtime executes them exactly, avoiding what was already tried.
-- "replan": the plan itself is wrong from here. Provide the remaining subtasks with steps.
-- "fail": the goal is impossible on this page (e.g. requires the user to be signed in).
+Diagnose from the OBSERVATION, not guesses: "no element matching X" with a list of visible labels usually means a wrong label (fix_step with the right one); a wrong URL or an unexpected page means the plan drifted (replan). SIDE-EFFECT RULE: if the failed step has sideEffect true, it may have taken effect even though verification failed — NEVER fix_step a repeat of that action; verdict must be replan with a verification-first approach, or stop.`;
 
-Typical blockers to consider: a dialog needs a recipient/field filled first, the target is behind a menu, the wrong element was targeted, a disabled button's precondition is unmet, the page requires login.`;
+const REPORT_SYSTEM_PROMPT = `You are writing the final user-facing answer for a browser agent run. You get the OBJECTIVE, the STATUS (achieved or partial), the JOURNAL of what happened, and the COLLECTED ITEMS (complete, deduplicated data gathered during the run).
+
+Reply ONLY with a JSON object: {"answer": "<the answer>"}
+
+Ground every fact ONLY in the journal and collected items — never invent data. For achieved: confirm what was done and present the results. For partial: lead with what WAS accomplished and found (list the actual data), then say briefly what could not be completed and why. If nothing useful was gathered, say so honestly in one sentence.`;
 
 // Tolerant JSON extraction (models sometimes wrap JSON in fences or prose)
 function parseJsonObject<T>(content: string): T {
@@ -247,23 +185,13 @@ export interface CallUsage {
   completionTokens: number | null;
 }
 
-/**
- * Per-role model selection: triage/checkpoint calls are frequent and easy —
- * they use the standard orchestrator model. Rescue, replan-under-failure and
- * salvage are rare and decide whether the whole run survives — they use the
- * strong model when one is configured.
- */
-type OrchestratorRole = 'standard' | 'strong';
-
 async function callOrchestrator<T>(
   systemPrompt: string,
   userContent: string,
   signal: AbortSignal,
-  role: OrchestratorRole = 'standard',
 ): Promise<{ value: T; usage: CallUsage }> {
-  const { orchestratorBaseUrl, orchestratorApiKey, orchestratorModel, orchestratorModelStrong } =
-    await chatSettingsStore.getSettings();
-  const model = role === 'strong' && orchestratorModelStrong ? orchestratorModelStrong : orchestratorModel;
+  const { orchestratorBaseUrl, orchestratorApiKey, orchestratorModel } = await chatSettingsStore.getSettings();
+  const model = orchestratorModel;
 
   const request = async (
     messages: { role: string; content: string }[],
@@ -273,7 +201,6 @@ async function callOrchestrator<T>(
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${orchestratorApiKey}`,
-        // OpenRouter attribution headers (ignored by other providers)
         'HTTP-Referer': 'https://github.com/koretex-ai/local-browser-use',
         'X-Title': 'Local Browser Use',
       },
@@ -281,7 +208,6 @@ async function callOrchestrator<T>(
         model,
         messages,
         temperature: 0.2,
-        // OpenRouter usage accounting: response.usage.cost in USD (ignored elsewhere)
         usage: { include: true },
       }),
       signal,
@@ -336,183 +262,62 @@ async function callOrchestrator<T>(
   }
 }
 
-export async function triageTask(
-  task: string,
+function journalSection(journal: string[]): string {
+  return journal.length ? `\n\nJOURNAL (everything tried and learned so far):\n${journal.join('\n')}` : '';
+}
+
+export async function planTask(
+  objective: string,
+  journal: string[],
+  pageDigest: string | undefined,
+  plansUsed: number,
+  maxPlans: number,
   signal: AbortSignal,
-  recipeDigest?: string[],
-  pageDigest?: string,
-): Promise<{ result: TriageResult; usage: CallUsage }> {
-  const librarySection = recipeDigest?.length
-    ? `\n\nRECIPE LIBRARY (saved programs from previous successful runs):\n${recipeDigest.join('\n')}`
-    : '';
-  const pageSection = pageDigest ? `\n\nCURRENT PAGE (the active tab as the task starts):\n${pageDigest}` : '';
-  const { value: result, usage } = await callOrchestrator<TriageResult>(
-    TRIAGE_SYSTEM_PROMPT,
-    `TASK: ${task}${pageSection}${librarySection}`,
-    signal,
-  );
-  if (!['chat', 'execute', 'plan', 'recipe'].includes(result.mode)) {
-    throw new Error(`Orchestrator returned invalid mode: ${String(result.mode)}`);
-  }
-  if (result.mode === 'plan' && (!Array.isArray(result.subtasks) || result.subtasks.length === 0)) {
-    // A plan with no subtasks degrades to direct execution
-    return { result: { mode: 'execute' }, usage };
-  }
-  return { result, usage };
-}
-
-const RECIPE_SAVE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent. A task run just finished — fully, or partially (out of budget). You get the task and the EXECUTED PLAN: the subtask programs that ran AND VERIFIED ok, including any mid-run corrections. Decide whether they form a reusable pattern worth saving as a RECIPE: a parameterized program that future matching tasks re-run directly instead of being planned again.
-
-Reply ONLY with a JSON object:
-{"save": true|false, "name": "<kebab-case, e.g. post-to-linkedin>", "site": "<primary domain, e.g. linkedin.com>", "intent": "<one line: what the recipe accomplishes>", "params": [{"name": "message", "description": "the text to post"}], "subtasks": [{"goal": "...", "success": "...", "steps": [...]}]}
-
-Parameterization rules:
-- Replace every TASK-SPECIFIC literal (post/message text, search queries, names, dates, counts, document titles) in goals, success criteria and step fields with {param} placeholders, and declare each one in "params" with a description of what fills it. Text composed for THIS task is a param; do not bake it in.
-- Keep SITE-STRUCTURE literals exactly as-is: URLs (parameterize only the query part when it carries a task value), element labels, key combos, wait times. These are the site lore that makes the recipe work.
-- Search-results URLs with an embedded query become a param inside the URL, e.g. "https://x.com/search?q={query}".
-- Numeric harvest targets ("until") may become a {count} param when the task chose the number.
-- Keep the subtask structure and step order exactly as executed — the program is verified to work; do not redesign it.
-
-PARTIAL RUNS: when the executed plan covers only part of the task (the run stopped before the deliverable), you may still save the reusable part — but "name" and "intent" must describe what the SAVED PROGRAM actually does (e.g. "linkedin-people-search: search LinkedIn people with location and network filters and collect profiles"), never the unfinished task. A working filtered-search URL or a verified navigation path is exactly the site lore worth banking from a failed run.
-
-save=false when the run is not a repeatable pattern: one-off research whose value was the answer itself, tasks tied to ephemeral page state, or plans that only worked through heavy improvisation (mostly goal-only subtasks without steps). save=true for action patterns likely to recur: posting/sending, form filling, collect-N-from-a-feed, create-document workflows.`;
-
-/**
- * Post-success parameterize call: turn the executed plan into a recipe
- * candidate. Standard model — it rewrites a verified program, no diagnosis.
- */
-export async function parameterizeRecipe(
-  task: string,
-  executedPlan: Subtask[],
-  signal: AbortSignal,
-): Promise<{ result: RecipeCandidate; usage: CallUsage }> {
-  const userContent = `TASK: ${task}\n\nEXECUTED PLAN (JSON):\n${JSON.stringify(executedPlan, null, 1)}`;
-  const { value: result, usage } = await callOrchestrator<RecipeCandidate>(
-    RECIPE_SAVE_SYSTEM_PROMPT,
-    userContent,
-    signal,
-  );
-  return { result, usage };
-}
-
-export interface StuckDigest {
-  goal: string;
-  actions: string[];
-  /** Labels of interactive elements currently on the page ("[i]<tag> label") */
-  elements: string[];
-  url?: string;
-  title?: string;
-  /** What earlier rescues in this task decided (so corrections don't thrash) */
-  priorRescues?: string[];
-  /** Data extracted so far in this task */
-  ledger?: string[];
-}
-
-function ledgerSection(ledger?: string[]): string {
-  return ledger?.length ? `\n\nDATA COLLECTED SO FAR:\n${ledger.slice(-10).join('\n')}` : '';
-}
-
-// Mid-subtask rescue: the executor is looping; ask for a corrected goal.
-// The digest widens the boundary to element LABELS (text), never pixels.
-// Diagnosis escalates like execution does: the first rescue uses the standard
-// orchestrator model; later rescues (the first correction already failed) use
-// the strong model.
-export async function rescueSubtask(
-  task: string,
-  stuck: StuckDigest,
-  signal: AbortSignal,
-  useStrongModel = false,
-): Promise<{ result: RescueResult; usage: CallUsage }> {
-  const priorRescues = stuck.priorRescues?.length
-    ? `\n\nPREVIOUS RESCUE ATTEMPTS:\n${stuck.priorRescues.join('\n')}`
-    : '';
+): Promise<{ result: PlanResult; usage: CallUsage }> {
+  const pageSection = pageDigest ? `\n\nCURRENT PAGE (the active tab right now):\n${pageDigest}` : '';
   const userContent =
-    `TASK: ${task}\n\nSTUCK SUBTASK GOAL: ${stuck.goal}\n\n` +
-    `PAGE: ${stuck.title ?? ''} — ${stuck.url ?? ''}\n` +
-    `ACTIONS TRIED:\n${stuck.actions.join('\n') || '(none)'}\n\n` +
-    `INTERACTIVE ELEMENTS ON PAGE:\n${stuck.elements.slice(0, 60).join('\n')}` +
-    priorRescues +
-    ledgerSection(stuck.ledger);
-  const { value: result, usage } = await callOrchestrator<RescueResult>(
-    RESCUE_SYSTEM_PROMPT,
-    userContent,
-    signal,
-    useStrongModel ? 'strong' : 'standard',
-  );
-  if (!['retry', 'replan', 'fail'].includes(result.decision)) {
-    throw new Error(`Orchestrator returned invalid rescue decision: ${String(result.decision)}`);
+    `OBJECTIVE: ${objective}\n\nPLANS USED: ${plansUsed} of ${maxPlans}` + pageSection + journalSection(journal);
+  const { value: result, usage } = await callOrchestrator<PlanResult>(PLAN_SYSTEM_PROMPT, userContent, signal);
+  if (!['chat', 'plan'].includes(result.mode)) {
+    throw new Error(`Planner returned invalid mode: ${String(result.mode)}`);
   }
   return { result, usage };
 }
 
-export interface CheckpointBudget {
-  /** How many replans the run can still afford */
-  replansRemaining: number;
-  /** Items in the local collection store (insertable via textFrom:"collected") */
-  collectedCount: number;
-}
-
-export async function checkpoint(
-  task: string,
-  plan: Subtask[],
-  outcomes: SubtaskOutcome[],
+export async function reflectOnFailure(
+  objective: string,
+  journal: string[],
+  planSteps: string[],
+  failedStepIndex: number,
+  failedStep: ProgramStep,
+  observation: string,
   signal: AbortSignal,
-  ledger?: string[],
-  budget?: CheckpointBudget,
-): Promise<{ result: CheckpointResult; usage: CallUsage }> {
-  const budgetSection = budget
-    ? `\n\nREPLANS REMAINING: ${budget.replansRemaining}\nLOCAL COLLECTION STORE: ${budget.collectedCount} item${budget.collectedCount === 1 ? '' : 's'} (insertable in full via "textFrom":"collected")`
-    : '';
+): Promise<{ result: ReflectResult; usage: CallUsage }> {
   const userContent =
-    `TASK: ${task}\n\n` +
-    `PLAN:\n${plan.map((s, i) => `${i + 1}. ${s.goal} (success: ${s.success})`).join('\n')}\n\n` +
-    `OUTCOMES SO FAR (JSON):\n${JSON.stringify(outcomes, null, 1)}` +
-    budgetSection +
-    ledgerSection(ledger);
-  const { value: result, usage } = await callOrchestrator<CheckpointResult>(
-    CHECKPOINT_SYSTEM_PROMPT,
-    userContent,
-    signal,
-  );
-  if (!['continue', 'replan', 'done', 'fail'].includes(result.decision)) {
-    throw new Error(`Orchestrator returned invalid decision: ${String(result.decision)}`);
+    `OBJECTIVE: ${objective}\n\n` +
+    `PLAN:\n${planSteps.map((s, i) => `${i + 1}. ${s}`).join('\n')}\n\n` +
+    `FAILED STEP (${failedStepIndex + 1} of ${planSteps.length}):\n${JSON.stringify(failedStep)}\n\n` +
+    `OBSERVATION:\n${observation}` +
+    journalSection(journal);
+  const { value: result, usage } = await callOrchestrator<ReflectResult>(REFLECT_SYSTEM_PROMPT, userContent, signal);
+  if (!['fix_step', 'replan', 'stop'].includes(result.verdict)) {
+    throw new Error(`Reflector returned invalid verdict: ${String(result.verdict)}`);
   }
   return { result, usage };
 }
 
-const SALVAGE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent. The run is out of budget and CANNOT continue, but some subtasks produced real information along the way. Write the best possible partial answer for the user from the outcome summaries.
-
-Reply ONLY with a JSON object: {"answer": "<partial answer>"}
-
-Rules: ground every fact ONLY in the outcome summaries — never invent data. Lead with what WAS found, then say briefly what could not be completed. If the outcomes contain no useful information at all, say so honestly in one sentence.`;
-
-/**
- * Budget exhausted — turn the trajectory into the best partial answer instead
- * of a bare failure. Uses the strong model: it is the last call of the run.
- */
-export async function salvageAnswer(
-  task: string,
-  outcomes: SubtaskOutcome[],
+export async function reportOutcome(
+  objective: string,
+  status: 'achieved' | 'partial',
+  journal: string[],
+  collection: string[],
   signal: AbortSignal,
-  ledger?: string[],
-  collection?: string[],
 ): Promise<{ answer: string; usage: CallUsage }> {
-  // The full collection store (not the truncated ledger digests) — the last
-  // call of the run deserves the complete data so the partial answer can
-  // list every item that was actually gathered
-  const collectionSection = collection?.length
+  const collectionSection = collection.length
     ? `\n\nCOLLECTED ITEMS (complete, deduplicated):\n${collection.slice(0, 100).join('\n').slice(0, 8000)}`
     : '';
-  const userContent =
-    `TASK: ${task}\n\nOUTCOMES (JSON):\n${JSON.stringify(outcomes, null, 1)}` +
-    ledgerSection(ledger) +
-    collectionSection;
-  const { value, usage } = await callOrchestrator<{ answer: string }>(
-    SALVAGE_SYSTEM_PROMPT,
-    userContent,
-    signal,
-    'strong',
-  );
-  if (!value.answer) throw new Error('Salvage returned no answer');
+  const userContent = `OBJECTIVE: ${objective}\n\nSTATUS: ${status}` + journalSection(journal) + collectionSection;
+  const { value, usage } = await callOrchestrator<{ answer: string }>(REPORT_SYSTEM_PROMPT, userContent, signal);
+  if (!value.answer) throw new Error('Report returned no answer');
   return { answer: value.answer, usage };
 }

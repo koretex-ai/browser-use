@@ -21,8 +21,8 @@ signed in to the relevant sites. Delete created artifacts between runs.
 Read from the side panel transcript; the meta line on the final message has cost/calls.
 
 1. **Delivered** — did the final deliverable actually exist and pass a manual check (open the sheet/doc/post)? yes / partial / no
-2. **Replans used** — count "Replanned" events (budget is 4)
-3. **Rescues used** — count "Stuck — orchestrator revised" events
+2. **Plans used** — count "Plan N/5" events (budget is 5)
+3. **Fixes/reflects used** — count "Corrected step" events and ✗ step lines
 4. **Unique items delivered** — rows/records in the deliverable, vs. requested
 5. **Cost** — `task total $X` from the final meta line
 6. **Wall time** — first to last timestamp
@@ -48,7 +48,7 @@ Commit: <hash>   Date: <date>
 
 - Delivered (yes or partial) on ≥ 8/9 runs; full "yes" on ≥ 6/9
 - Zero runs that end with data collected but the deliverable never attempted
-- T1 median ≤ 2 replans (was: 4/4 exhausted before the deliverable, twice)
+- T1 median ≤ 2 plans (was: 4/4 replans exhausted before the deliverable, twice, on the old engine)
 
 ## Known caveats
 

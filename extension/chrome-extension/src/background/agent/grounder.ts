@@ -97,7 +97,8 @@ export async function groundTarget(tabId: number, instruction: string, signal: A
  * the machine; only the text verdict reaches the cloud orchestrator.
  */
 export async function verifyVisual(tabId: number, question: string, signal: AbortSignal): Promise<string> {
-  const { baseUrl, grounderModel } = await chatSettingsStore.getSettings();
+  const { baseUrl, verifierModel, grounderModel } = await chatSettingsStore.getSettings();
+  const model = verifierModel || grounderModel;
   const shot = await captureScreenshot(tabId, GROUNDER_SCREENSHOT_OPTS);
   const base64 = shot.dataUrl.replace(/^data:[^,]+,/, '');
 
@@ -105,7 +106,7 @@ export async function verifyVisual(tabId: number, question: string, signal: Abor
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: grounderModel,
+      model,
       messages: [
         {
           role: 'user',
@@ -123,7 +124,7 @@ export async function verifyVisual(tabId: number, question: string, signal: Abor
     signal,
   });
   if (!response.ok) {
-    throw new Error(`Visual verify request failed (HTTP ${response.status}). Is ${grounderModel} pulled?`);
+    throw new Error(`Visual verify request failed (HTTP ${response.status}). Is ${model} pulled?`);
   }
   const data = await response.json();
   if (data.error) throw new Error(data.error);

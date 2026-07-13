@@ -10,6 +10,8 @@ export interface ChatSettingsConfig {
   model: string;
   /** Vision grounder model (screenshot -> click coordinates) */
   grounderModel: string;
+  /** Vision verifier model (screenshot + question -> yes/no verdict) */
+  verifierModel: string;
   /** Hybrid mode: strong cloud model plans/decomposes/validates; local models execute */
   orchestratorEnabled: boolean;
   /** OpenAI-compatible endpoint base URL (e.g. https://openrouter.ai/api/v1) */
@@ -40,6 +42,9 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettingsConfig = {
   baseUrl: 'http://localhost:11434',
   model: 'qwen3.5:4b',
   grounderModel: 'hf.co/mradermacher/Holo1.5-3B-GGUF:Q4_K_M',
+  // Dedicated VQA model for step verification: Holo is a grounding specialist,
+  // not a yes/no judge. 3B keeps all three local models resident on 18GB.
+  verifierModel: 'qwen2.5vl:3b',
   orchestratorEnabled: true,
   orchestratorBaseUrl: 'https://openrouter.ai/api/v1',
   orchestratorApiKey: '',
