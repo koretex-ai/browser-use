@@ -341,7 +341,7 @@ export async function triageTask(
   return { result, usage };
 }
 
-const RECIPE_SAVE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent. A task just completed successfully. You get the task and the EXECUTED PLAN — the subtask programs that actually ran, including any mid-run corrections. Decide whether this is a reusable pattern worth saving as a RECIPE: a parameterized program that future matching tasks re-run directly instead of being planned again.
+const RECIPE_SAVE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent. A task run just finished — fully, or partially (out of budget). You get the task and the EXECUTED PLAN: the subtask programs that ran AND VERIFIED ok, including any mid-run corrections. Decide whether they form a reusable pattern worth saving as a RECIPE: a parameterized program that future matching tasks re-run directly instead of being planned again.
 
 Reply ONLY with a JSON object:
 {"save": true|false, "name": "<kebab-case, e.g. post-to-linkedin>", "site": "<primary domain, e.g. linkedin.com>", "intent": "<one line: what the recipe accomplishes>", "params": [{"name": "message", "description": "the text to post"}], "subtasks": [{"goal": "...", "success": "...", "steps": [...]}]}
@@ -352,6 +352,8 @@ Parameterization rules:
 - Search-results URLs with an embedded query become a param inside the URL, e.g. "https://x.com/search?q={query}".
 - Numeric harvest targets ("until") may become a {count} param when the task chose the number.
 - Keep the subtask structure and step order exactly as executed — the program is verified to work; do not redesign it.
+
+PARTIAL RUNS: when the executed plan covers only part of the task (the run stopped before the deliverable), you may still save the reusable part — but "name" and "intent" must describe what the SAVED PROGRAM actually does (e.g. "linkedin-people-search: search LinkedIn people with location and network filters and collect profiles"), never the unfinished task. A working filtered-search URL or a verified navigation path is exactly the site lore worth banking from a failed run.
 
 save=false when the run is not a repeatable pattern: one-off research whose value was the answer itself, tasks tied to ephemeral page state, or plans that only worked through heavy improvisation (mostly goal-only subtasks without steps). save=true for action patterns likely to recur: posting/sending, form filling, collect-N-from-a-feed, create-document workflows.`;
 

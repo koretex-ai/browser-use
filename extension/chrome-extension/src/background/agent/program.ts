@@ -119,10 +119,26 @@ function describeStep(step: ProgramStep): string {
   }
 }
 
+function listLines(answer: string): string[] {
+  return answer.split('\n').filter(line => /^\s*(?:[-*•]|\d+[.)])/.test(line));
+}
+
 // Rough count of collected items in an extract answer (list lines)
 function countItems(answer: string): number {
-  const lines = answer.split('\n').filter(line => /^\s*(?:[-*•]|\d+[.)])/.test(line));
-  return lines.length || 1;
+  return listLines(answer).length || 1;
+}
+
+// Normalize a harvested line to a dedup key: bullets/numbering, digits
+// (engagement counts, list positions) and whitespace/case must not
+// distinguish two sightings of the same item
+function itemKey(line: string): string {
+  return line
+    .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '')
+    .toLowerCase()
+    .replace(/[0-9]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
 }
 
 function pageSignature(state: PerceptionSnapshot | null): string {
@@ -200,14 +216,41 @@ export async function runProgramSubtask(
     historyContext: history.slice(-8),
   });
 
-  // Run one extract (ledger- and dedup-aware); returns new-item count
-  const runExtract = async (query: string): Promise<{ newItems: number; note: string }> => {
+  // Run one extract (ledger- and dedup-aware); returns new-item count.
+  // With `seen` (harvest mode) the HARNESS deduplicates: the local reader
+  // re-reports items that stay in view across scrolls (its NOTHING-NEW check
+  // sees only a truncated ledger window), so only never-seen lines count
+  // toward the target — and only they reach the ledger, keeping checkpoint
+  // payloads free of duplicates.
+  const runExtract = async (query: string, seen?: Set<string>): Promise<{ newItems: number; note: string }> => {
     const pageText = await capturePageText(tabId).catch(() => lastState?.pageText ?? '');
     const { answer } = await extractFromPage(query, pageText, signal, LOCAL_ENDPOINT, ctx.knownData?.() ?? []);
     if (/^NOTHING NEW/i.test(answer)) return { newItems: 0, note: 'nothing new' };
     if (answer.startsWith('NOT FOUND')) return { newItems: 0, note: answer.slice(0, 120) };
-    ctx.onExtract?.(query, answer);
-    collected.push(answer.slice(0, MAX_EXTRACT_SUMMARY_CHARS));
+    let reported = answer;
+    let newItems = countItems(answer);
+    if (seen) {
+      const lines = listLines(answer);
+      if (lines.length > 0) {
+        const fresh = lines.filter(line => {
+          const key = itemKey(line);
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        if (fresh.length === 0) return { newItems: 0, note: 'no new items (all already collected)' };
+        reported = fresh.join('\n');
+        newItems = fresh.length;
+      } else {
+        // Prose answer: treat the whole thing as one item
+        const key = itemKey(answer);
+        if (seen.has(key)) return { newItems: 0, note: 'no new items (same as before)' };
+        seen.add(key);
+        newItems = 1;
+      }
+    }
+    ctx.onExtract?.(query, reported);
+    collected.push(reported.slice(0, MAX_EXTRACT_SUMMARY_CHARS));
     if (lastState) {
       trajectoryStore
         .appendStep({
@@ -220,7 +263,7 @@ export async function runProgramSubtask(
         })
         .catch(error => logger.warning('trajectory logging failed:', error));
     }
-    return { newItems: countItems(answer), note: answer.slice(0, 160) };
+    return { newItems, note: reported.slice(0, 160) };
   };
 
   const execStep = async (step: ProgramStep): Promise<{ ok: boolean; message: string }> => {
@@ -298,28 +341,33 @@ export async function runProgramSubtask(
         if (!step.query) return { ok: false, message: 'harvest step has no query' };
         const target = step.until ?? 10;
         const maxScrolls = Math.min(step.maxScrolls ?? HARVEST_DEFAULT_MAX_SCROLLS, 12);
+        // Harness-side dedup across rounds: feed pages keep the same items in
+        // view while scrolling, so re-sightings must not count toward `until`
+        const seen = new Set<string>();
         let total = 0;
         let noChange = 0;
         let lastSig = '';
         for (let round = 0; round <= maxScrolls; round++) {
           if (signal.aborted) throw new DOMException('aborted', 'AbortError');
-          const { newItems } = await runExtract(step.query);
+          const { newItems } = await runExtract(step.query, seen);
           total += newItems;
-          if (total >= target) return { ok: true, message: `collected ~${total} items` };
+          if (total >= target) return { ok: true, message: `collected ${total} unique items` };
           await executeAction(tabId, taskId, { type: 'scroll', direction: 'down' }, lastState, logContextFor(step));
           const state = await perceive();
           const sig = pageSignature(state);
-          if (sig === lastSig) {
+          // A round is dry when the page did not change OR it yielded nothing
+          // new (the reader can saturate while the page keeps loading)
+          if (sig === lastSig || newItems === 0) {
             noChange++;
             if (noChange >= HARVEST_NO_CHANGE_LIMIT) {
-              return { ok: true, message: `collected ~${total} items; results stopped loading` };
+              return { ok: true, message: `collected ${total} unique items; results stopped yielding new ones` };
             }
           } else {
             noChange = 0;
-            lastSig = sig;
           }
+          lastSig = sig;
         }
-        return { ok: true, message: `collected ~${total} items in ${maxScrolls} scrolls` };
+        return { ok: true, message: `collected ${total} unique items in ${maxScrolls} scrolls` };
       }
       default:
         return { ok: false, message: `unknown step "${String(step.do)}"` };

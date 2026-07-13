@@ -659,6 +659,10 @@ async function runOrchestratedTask(
       finishFail(reason, meta);
       return;
     }
+    // Even a failed run may have VERIFIED reusable site lore along the way
+    // (e.g. a working filtered-search URL) — bank the succeeded programs as a
+    // partial recipe before salvaging the answer
+    await maybeSaveRecipe();
     try {
       const { answer, usage } = await salvageAnswer(task, leanOutcomes(outcomes), signal, ledger);
       finishFail(`${answer}\n\n(${reason})`, track(usage));
@@ -951,8 +955,10 @@ async function runOrchestratedTask(
   // succeeded, in execution order — what saveRecipeCandidate parameterizes
   const executedPlan: Subtask[] = [];
   const maybeSaveRecipe = async () => {
-    // Cold plan-mode successes only: recipe runs record use/repairs instead,
-    // and single-action execute tasks are not worth saving
+    // Cold plan-mode runs only: recipe runs record use/repairs instead, and
+    // single-action execute tasks are not worth saving. Fires on done AND on
+    // useful salvage — a partial run's succeeded programs are still verified
+    // site lore (the parameterizer names the recipe for what it actually does)
     if (record.mode !== 'plan' || executedPlan.length === 0) return;
     // Nothing deterministic to replay — a recipe of goal-only improvisation
     // would re-run the unreliable path, not the verified one
