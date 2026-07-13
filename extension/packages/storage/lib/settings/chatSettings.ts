@@ -16,6 +16,18 @@ export interface ChatSettingsConfig {
   orchestratorBaseUrl: string;
   orchestratorApiKey: string;
   orchestratorModel: string;
+  /** Strong model for rare high-stakes orchestrator calls (rescue/replan/salvage) */
+  orchestratorModelStrong: string;
+  /**
+   * Escalation: when the local executor gets stuck, let a cloud model drive
+   * the browser directly. Text-only — element labels and page text cross the
+   * boundary; screenshots never do (grounding stays local).
+   */
+  cloudExecutorEnabled: boolean;
+  /** Tier-1 escalated executor model (first stuck-rescue) */
+  executorModelTier1: string;
+  /** Tier-2 escalated executor model (tier 1 also got stuck) */
+  executorModelTier2: string;
 }
 
 export type ChatSettingsStorage = BaseStorage<ChatSettingsConfig> & {
@@ -32,6 +44,13 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettingsConfig = {
   orchestratorBaseUrl: 'https://openrouter.ai/api/v1',
   orchestratorApiKey: '',
   orchestratorModel: 'z-ai/glm-5.2',
+  // Empty = strong-role calls (rescue 2+/salvage) fall back to the standard
+  // orchestrator model. User verdict 2026-07-12: Kimi is pricier and weaker
+  // than GLM-5.2 — one model for all orchestration.
+  orchestratorModelStrong: '',
+  cloudExecutorEnabled: true,
+  executorModelTier1: 'z-ai/glm-5.2',
+  executorModelTier2: 'z-ai/glm-5.2',
 };
 
 const storage = createStorage<ChatSettingsConfig>('chat-settings', DEFAULT_CHAT_SETTINGS, {

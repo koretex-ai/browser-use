@@ -88,3 +88,46 @@ export async function groundTarget(tabId: number, instruction: string, signal: A
     target: instruction,
   };
 }
+
+/**
+ * Local vision verification: answer a question about the CURRENT screenshot
+ * with the local VLM. Built for canvas editors (Google Docs/Sheets) whose
+ * content is invisible to DOM text extraction — this is the only way to
+ * confirm a write landed. Privacy boundary intact: the screenshot stays on
+ * the machine; only the text verdict reaches the cloud orchestrator.
+ */
+export async function verifyVisual(tabId: number, question: string, signal: AbortSignal): Promise<string> {
+  const { baseUrl, grounderModel } = await chatSettingsStore.getSettings();
+  const shot = await captureScreenshot(tabId, GROUNDER_SCREENSHOT_OPTS);
+  const base64 = shot.dataUrl.replace(/^data:[^,]+,/, '');
+
+  const response = await fetch(`${baseUrl}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: grounderModel,
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Look at this ${shot.width}x${shot.height} screenshot of a web page and answer the question.\n` +
+            `QUESTION: ${question}\n` +
+            'If the question asks whether something is visible/present, start your answer with YES or NO, ' +
+            'then quote the relevant text you can actually see. Be concise and only describe what is in the image.',
+          images: [base64],
+        },
+      ],
+      stream: false,
+      options: { temperature: 0 },
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`Visual verify request failed (HTTP ${response.status}). Is ${grounderModel} pulled?`);
+  }
+  const data = await response.json();
+  if (data.error) throw new Error(data.error);
+  const answer: string = (data.message?.content ?? '').trim();
+  logger.info('visual verify:', question.slice(0, 80), '->', answer.slice(0, 160));
+  return answer;
+}

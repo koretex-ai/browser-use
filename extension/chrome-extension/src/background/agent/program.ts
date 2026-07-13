@@ -1,0 +1,376 @@
+import type { PerceptionSnapshot } from '@extension/storage';
+import { Actors, trajectoryStore } from '@extension/storage';
+import { createLogger } from '../log';
+import { postExecutionEvent } from '../events';
+import { capturePageState, capturePageText } from '../perception';
+import { executeAction } from '../actions/executor';
+import { extractFromPage, LOCAL_ENDPOINT } from './planner';
+import { groundTarget, verifyVisual } from './grounder';
+import type { ProgramStep } from './orchestrator';
+import type { SubtaskRunResult } from './loop';
+
+const logger = createLogger('program');
+
+/**
+ * Deterministic program runner — the "harness as runtime" half of the
+ * compiler architecture. The cloud orchestrator emits subtasks as typed
+ * steps; this module executes them directly, with NO local planner in
+ * between (the 4B model reinterpreting explicit instructions was the root
+ * cause of most failures). Local models are used only as senses:
+ *  - resolveTarget: description -> element index (deterministic label match)
+ *  - Holo grounding: vision fallback when the DOM match fails (clicks only)
+ *  - extractFromPage: reading data out of the page text
+ */
+
+const MAX_PROGRAM_STEPS = 15;
+const STEP_RETRIES = 2;
+const HARVEST_DEFAULT_MAX_SCROLLS = 6;
+const HARVEST_NO_CHANGE_LIMIT = 2;
+const MAX_EXTRACT_SUMMARY_CHARS = 600;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+export interface ProgramContext {
+  taskRecordId: string;
+  success: string;
+  stepPrefix: string;
+  /** Receives every extract result, for the task-level data ledger */
+  onExtract?: (query: string, answer: string) => void;
+  /** Live view of already-collected data, so extracts report only NEW items */
+  knownData?: () => string[];
+}
+
+function elementsDigestOf(state: PerceptionSnapshot | null): string[] {
+  if (!state) return [];
+  return state.elements.slice(0, 60).map(el => {
+    const kind = el.role && el.role !== el.tag ? `${el.tag}:${el.role}` : el.tag;
+    const label = (el.text || el.placeholder || el.href || '').slice(0, 60);
+    return `[${el.index}]<${kind}> ${label}`.trim();
+  });
+}
+
+function normalizeLabel(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/['"''""`]/g, '')
+    .replace(/[!?,;:()[\]{}<>|~^*+=]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Resolve a target description ("the 'Start a post' button") to an element
+ * index by label matching. Deterministic, no model call. Returns null when
+ * no confident match exists (caller falls back to vision grounding).
+ */
+export function resolveTarget(state: PerceptionSnapshot, target: string): number | null {
+  const wanted = normalizeLabel(target);
+  if (!wanted) return null;
+  const wantedTokens = new Set(wanted.split(' '));
+
+  let bestIndex: number | null = null;
+  let bestScore = 0;
+  for (const el of state.elements) {
+    const label = normalizeLabel(el.text || el.placeholder || el.value || '');
+    if (!label) continue;
+    let score = 0;
+    if (label === wanted) {
+      score = 1;
+    } else if (label.includes(wanted) || wanted.includes(label)) {
+      score = (0.9 * Math.min(label.length, wanted.length)) / Math.max(label.length, wanted.length);
+    } else {
+      const labelTokens = new Set(label.split(' '));
+      let common = 0;
+      for (const token of wantedTokens) if (labelTokens.has(token)) common++;
+      score = (0.8 * common) / Math.max(wantedTokens.size, labelTokens.size);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = el.index;
+    }
+  }
+  return bestScore >= 0.45 ? bestIndex : null;
+}
+
+function describeStep(step: ProgramStep): string {
+  switch (step.do) {
+    case 'navigate':
+      return `navigate to ${step.url}`;
+    case 'click':
+      return `click "${step.target}"`;
+    case 'type':
+      return `type "${step.text}" into "${step.target}"`;
+    case 'type_focused':
+      return `type ${String(step.text ?? '').split('\n').length} line(s) into the focused editor`;
+    case 'key':
+      return `press ${step.combo}`;
+    case 'scroll':
+      return `scroll ${step.direction ?? 'down'}${step.times && step.times > 1 ? ` x${step.times}` : ''}`;
+    case 'extract':
+      return `extract "${step.query}"`;
+    case 'harvest':
+      return `harvest "${step.query}" until ${step.until ?? 10} items`;
+    case 'verify_visual':
+      return `verify visually: "${step.question}"`;
+    case 'wait':
+      return `wait ${step.ms ?? 1000}ms`;
+    default:
+      return JSON.stringify(step).slice(0, 80);
+  }
+}
+
+// Rough count of collected items in an extract answer (list lines)
+function countItems(answer: string): number {
+  const lines = answer.split('\n').filter(line => /^\s*(?:[-*•]|\d+[.)])/.test(line));
+  return lines.length || 1;
+}
+
+function pageSignature(state: PerceptionSnapshot | null): string {
+  if (!state) return 'no-state';
+  return `${state.url}|${state.scroll.y}|${(state.pageText ?? '').slice(0, 300)}`;
+}
+
+/**
+ * Execute one program subtask. Steps run exactly as written; a step gets one
+ * retry (after a beat, with fresh perception), then the subtask fails and the
+ * normal rescue/checkpoint machinery takes over.
+ */
+export async function runProgramSubtask(
+  port: chrome.runtime.Port,
+  tabId: number,
+  taskId: string,
+  goal: string,
+  steps: ProgramStep[],
+  ctx: ProgramContext,
+  signal: AbortSignal,
+): Promise<SubtaskRunResult> {
+  const subtaskId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const history: string[] = [];
+  const collected: string[] = [];
+  let lastState: PerceptionSnapshot | null = null;
+  let stepsCount = 0;
+  const meta = '⚙ program (deterministic) · $0';
+
+  const finalize = async (status: 'ok' | 'fail', summary: string): Promise<SubtaskRunResult> => {
+    // Evidence for the checkpoint: the page as the program left it
+    lastState = await capturePageState(tabId, false).catch(() => lastState);
+    await trajectoryStore
+      .appendSubtask({
+        id: subtaskId,
+        sessionId: taskId,
+        taskRecordId: ctx.taskRecordId,
+        goal,
+        success: ctx.success,
+        status,
+        summary,
+        stepsCount,
+        plannedBy: 'orchestrator',
+        plannerTier: 0,
+        plannerModel: 'program',
+        startedAt,
+        endedAt: Date.now(),
+      })
+      .catch(error => logger.warning('subtask record failed:', error));
+    return {
+      status,
+      summary,
+      actions: history.slice(-6),
+      url: lastState?.url,
+      title: lastState?.title,
+      elementsDigest: elementsDigestOf(lastState),
+      pageTextExcerpt: lastState?.pageText?.slice(0, 800),
+    };
+  };
+
+  const perceive = async (): Promise<PerceptionSnapshot | null> => {
+    const state = await capturePageState(tabId, false).catch(async () => {
+      await sleep(1500);
+      return capturePageState(tabId, false).catch(() => null);
+    });
+    lastState = state ?? lastState;
+    return state;
+  };
+
+  const logContextFor = (step: ProgramStep) => ({
+    subtaskId,
+    decision: step,
+    plannerModel: 'program',
+    plannerTier: 0,
+    historyContext: history.slice(-8),
+  });
+
+  // Run one extract (ledger- and dedup-aware); returns new-item count
+  const runExtract = async (query: string): Promise<{ newItems: number; note: string }> => {
+    const pageText = await capturePageText(tabId).catch(() => lastState?.pageText ?? '');
+    const { answer } = await extractFromPage(query, pageText, signal, LOCAL_ENDPOINT, ctx.knownData?.() ?? []);
+    if (/^NOTHING NEW/i.test(answer)) return { newItems: 0, note: 'nothing new' };
+    if (answer.startsWith('NOT FOUND')) return { newItems: 0, note: answer.slice(0, 120) };
+    ctx.onExtract?.(query, answer);
+    collected.push(answer.slice(0, MAX_EXTRACT_SUMMARY_CHARS));
+    if (lastState) {
+      trajectoryStore
+        .appendStep({
+          sessionId: taskId,
+          before: lastState,
+          action: { type: 'extract', query },
+          ok: true,
+          timestamp: Date.now(),
+          ...logContextFor({ do: 'extract', query }),
+        })
+        .catch(error => logger.warning('trajectory logging failed:', error));
+    }
+    return { newItems: countItems(answer), note: answer.slice(0, 160) };
+  };
+
+  const execStep = async (step: ProgramStep): Promise<{ ok: boolean; message: string }> => {
+    switch (step.do) {
+      case 'navigate':
+        if (!step.url) return { ok: false, message: 'navigate step has no url' };
+        return executeAction(tabId, taskId, { type: 'navigate', url: step.url }, lastState, logContextFor(step));
+      case 'key':
+        if (!step.combo) return { ok: false, message: 'key step has no combo' };
+        return executeAction(tabId, taskId, { type: 'key', combo: step.combo }, lastState, logContextFor(step));
+      case 'type_focused':
+        if (!step.text) return { ok: false, message: 'type_focused step has no text' };
+        return executeAction(
+          tabId,
+          taskId,
+          { type: 'type_focused', text: step.text },
+          lastState,
+          logContextFor(step),
+        );
+      case 'wait':
+        await sleep(Math.min(step.ms ?? 1000, 10000));
+        return { ok: true, message: `waited ${step.ms ?? 1000}ms` };
+      case 'scroll': {
+        const times = Math.min(step.times ?? 1, 10);
+        for (let i = 0; i < times; i++) {
+          await executeAction(
+            tabId,
+            taskId,
+            { type: 'scroll', direction: step.direction ?? 'down' },
+            lastState,
+            logContextFor(step),
+          );
+        }
+        return { ok: true, message: `scrolled ${step.direction ?? 'down'} x${times}` };
+      }
+      case 'click': {
+        if (!step.target) return { ok: false, message: 'click step has no target' };
+        const state = await perceive();
+        if (!state) return { ok: false, message: 'could not read the page to locate the target' };
+        const index = resolveTarget(state, step.target);
+        if (index !== null) {
+          return executeAction(tabId, taskId, { type: 'click', index }, state, logContextFor(step));
+        }
+        // Vision fallback: Holo locates the target on the screenshot
+        try {
+          const point = await groundTarget(tabId, step.target, signal);
+          return executeAction(
+            tabId,
+            taskId,
+            { type: 'click_at', x: point.x, y: point.y, target: point.target },
+            state,
+            logContextFor(step),
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          const message = error instanceof Error ? error.message : String(error);
+          return { ok: false, message: `no element matching "${step.target}" (vision fallback: ${message})` };
+        }
+      }
+      case 'type': {
+        if (!step.target || !step.text) return { ok: false, message: 'type step needs target and text' };
+        const state = await perceive();
+        if (!state) return { ok: false, message: 'could not read the page to locate the input' };
+        const index = resolveTarget(state, step.target);
+        if (index === null) return { ok: false, message: `no input element matching "${step.target}"` };
+        return executeAction(
+          tabId,
+          taskId,
+          { type: 'type', index, text: step.text },
+          state,
+          logContextFor(step),
+        );
+      }
+      case 'extract': {
+        if (!step.query) return { ok: false, message: 'extract step has no query' };
+        const { note } = await runExtract(step.query);
+        return { ok: true, message: note };
+      }
+      case 'verify_visual': {
+        if (!step.question) return { ok: false, message: 'verify_visual step has no question' };
+        // Local VLM reads the screenshot; only the verdict leaves the machine
+        const answer = await verifyVisual(tabId, step.question, signal);
+        collected.push(`visual check "${step.question.slice(0, 80)}": ${answer.slice(0, 300)}`);
+        return { ok: true, message: answer.slice(0, 200) };
+      }
+      case 'harvest': {
+        if (!step.query) return { ok: false, message: 'harvest step has no query' };
+        const target = step.until ?? 10;
+        const maxScrolls = Math.min(step.maxScrolls ?? HARVEST_DEFAULT_MAX_SCROLLS, 12);
+        let total = 0;
+        let noChange = 0;
+        let lastSig = '';
+        for (let round = 0; round <= maxScrolls; round++) {
+          if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+          const { newItems } = await runExtract(step.query);
+          total += newItems;
+          if (total >= target) return { ok: true, message: `collected ~${total} items` };
+          await executeAction(tabId, taskId, { type: 'scroll', direction: 'down' }, lastState, logContextFor(step));
+          const state = await perceive();
+          const sig = pageSignature(state);
+          if (sig === lastSig) {
+            noChange++;
+            if (noChange >= HARVEST_NO_CHANGE_LIMIT) {
+              return { ok: true, message: `collected ~${total} items; results stopped loading` };
+            }
+          } else {
+            noChange = 0;
+            lastSig = sig;
+          }
+        }
+        return { ok: true, message: `collected ~${total} items in ${maxScrolls} scrolls` };
+      }
+      default:
+        return { ok: false, message: `unknown step "${String(step.do)}"` };
+    }
+  };
+
+  try {
+    for (const [i, step] of steps.slice(0, MAX_PROGRAM_STEPS).entries()) {
+      if (signal.aborted) throw new DOMException('aborted', 'AbortError');
+      stepsCount++;
+      let result = { ok: false, message: 'not run' };
+      for (let attempt = 1; attempt <= STEP_RETRIES; attempt++) {
+        result = await execStep(step);
+        if (result.ok) break;
+        if (attempt < STEP_RETRIES) await sleep(1200);
+      }
+      history.push(`${describeStep(step)} -> ${result.ok ? result.message || 'ok' : `FAILED: ${result.message}`}`);
+      postExecutionEvent(
+        port,
+        Actors.SYSTEM,
+        'step.ok',
+        taskId,
+        `${ctx.stepPrefix}Step ${i + 1}: ${describeStep(step)}${result.ok ? '' : ` — FAILED: ${result.message.slice(0, 120)}`}`,
+        meta,
+      );
+      if (!result.ok) {
+        return await finalize(
+          'fail',
+          `Program step ${i + 1} of ${steps.length} failed — ${describeStep(step)}: ${result.message}`,
+        );
+      }
+    }
+    const dataNote = collected.length
+      ? ` Collected data:\n${collected.slice(-4).join('\n').slice(0, 1200)}`
+      : '';
+    return await finalize('ok', `All ${Math.min(steps.length, MAX_PROGRAM_STEPS)} program steps completed.${dataNote}`);
+  } catch (error) {
+    if (signal.aborted) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    return await finalize('fail', `Program crashed at step ${stepsCount}: ${message}`);
+  }
+}

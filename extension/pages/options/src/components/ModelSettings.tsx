@@ -19,6 +19,10 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
   const [orchestratorBaseUrl, setOrchestratorBaseUrl] = useState(DEFAULT_CHAT_SETTINGS.orchestratorBaseUrl);
   const [orchestratorApiKey, setOrchestratorApiKey] = useState(DEFAULT_CHAT_SETTINGS.orchestratorApiKey);
   const [orchestratorModel, setOrchestratorModel] = useState(DEFAULT_CHAT_SETTINGS.orchestratorModel);
+  const [orchestratorModelStrong, setOrchestratorModelStrong] = useState(DEFAULT_CHAT_SETTINGS.orchestratorModelStrong);
+  const [cloudExecutorEnabled, setCloudExecutorEnabled] = useState(DEFAULT_CHAT_SETTINGS.cloudExecutorEnabled);
+  const [executorModelTier1, setExecutorModelTier1] = useState(DEFAULT_CHAT_SETTINGS.executorModelTier1);
+  const [executorModelTier2, setExecutorModelTier2] = useState(DEFAULT_CHAT_SETTINGS.executorModelTier2);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [connection, setConnection] = useState<ConnectionStatus>({ state: 'idle' });
   const [saved, setSaved] = useState(false);
@@ -32,6 +36,10 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
       setOrchestratorBaseUrl(settings.orchestratorBaseUrl);
       setOrchestratorApiKey(settings.orchestratorApiKey);
       setOrchestratorModel(settings.orchestratorModel);
+      setOrchestratorModelStrong(settings.orchestratorModelStrong);
+      setCloudExecutorEnabled(settings.cloudExecutorEnabled);
+      setExecutorModelTier1(settings.executorModelTier1);
+      setExecutorModelTier2(settings.executorModelTier2);
     });
   }, []);
 
@@ -64,6 +72,10 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
       orchestratorBaseUrl: orchestratorBaseUrl.replace(/\/$/, ''),
       orchestratorApiKey: orchestratorApiKey.trim(),
       orchestratorModel: orchestratorModel.trim(),
+      orchestratorModelStrong: orchestratorModelStrong.trim(),
+      cloudExecutorEnabled,
+      executorModelTier1: executorModelTier1.trim(),
+      executorModelTier2: executorModelTier2.trim(),
     });
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
@@ -190,8 +202,8 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
         </div>
         <p className={`mb-4 text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
           A strong cloud model plans, decomposes and validates tasks; the local models still do all the browsing.
-          Screenshots and page content never leave your machine — only the task and step summaries are sent. Without
-          an API key the agent runs fully local.
+          Screenshots never leave your machine — only the task, step summaries and element labels are sent (plus page
+          text if the cloud executor fallback below is enabled). Without an API key the agent runs fully local.
         </p>
 
         <div className="space-y-4">
@@ -257,6 +269,76 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div>
+            <label htmlFor="orch-model-strong" className={labelClass}>
+              Strong orchestrator model (rescue / replan / salvage)
+            </label>
+            <input
+              id="orch-model-strong"
+              type="text"
+              value={orchestratorModelStrong}
+              onChange={e => setOrchestratorModelStrong(e.target.value)}
+              placeholder={DEFAULT_CHAT_SETTINGS.orchestratorModelStrong}
+              className={inputClass}
+            />
+            <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+              Used only for the rare calls that decide whether a run survives. Leave empty to always use the
+              orchestrator model.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className={`border-t pt-6 ${isDarkMode ? 'border-[#1F7A4A]/40' : 'border-gray-200'}`}>
+        <div className="mb-1 flex items-center justify-between">
+          <h2 className={`text-lg font-semibold ${isDarkMode ? 'text-gray-200' : 'text-gray-800'}`}>
+            Cloud executor fallback
+          </h2>
+          <label className="flex cursor-pointer items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={cloudExecutorEnabled}
+              onChange={e => setCloudExecutorEnabled(e.target.checked)}
+              className="size-4 accent-[#2BE87D]"
+            />
+            <span className={isDarkMode ? 'text-gray-300' : 'text-gray-700'}>Enabled</span>
+          </label>
+        </div>
+        <p className={`mb-4 text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+          When the local executor gets stuck, a cloud model takes over driving the browser for that subtask (tier 1,
+          then tier 2 if still stuck). Text-only: element labels and page text are sent; screenshots never are. Uses
+          the orchestrator endpoint and API key.
+        </p>
+
+        <div className="space-y-4">
+          <div>
+            <label htmlFor="exec-tier1" className={labelClass}>
+              Tier-1 executor model
+            </label>
+            <input
+              id="exec-tier1"
+              type="text"
+              value={executorModelTier1}
+              onChange={e => setExecutorModelTier1(e.target.value)}
+              placeholder={DEFAULT_CHAT_SETTINGS.executorModelTier1}
+              className={inputClass}
+            />
+          </div>
+
+          <div>
+            <label htmlFor="exec-tier2" className={labelClass}>
+              Tier-2 executor model (frontier)
+            </label>
+            <input
+              id="exec-tier2"
+              type="text"
+              value={executorModelTier2}
+              onChange={e => setExecutorModelTier2(e.target.value)}
+              placeholder={DEFAULT_CHAT_SETTINGS.executorModelTier2}
+              className={inputClass}
+            />
           </div>
         </div>
       </div>
