@@ -641,8 +641,7 @@ const SidePanel = () => {
 
   return (
     <div>
-      <div
-        className="flex h-screen flex-col overflow-hidden rounded-2xl border border-[#1F7A4A]/40 bg-[#0A150F]">
+      <div className="flex h-screen flex-col overflow-hidden rounded-2xl border border-[#1F7A4A]/40 bg-[#0A150F]">
         <header className="header relative">
           <div className="header-logo">
             {showHistory ? (

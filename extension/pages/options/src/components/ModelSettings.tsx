@@ -308,8 +308,8 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
         </div>
         <p className={`mb-4 text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
           When the local executor gets stuck, a cloud model takes over driving the browser for that subtask (tier 1,
-          then tier 2 if still stuck). Text-only: element labels and page text are sent; screenshots never are. Uses
-          the orchestrator endpoint and API key.
+          then tier 2 if still stuck). Text-only: element labels and page text are sent; screenshots never are. Uses the
+          orchestrator endpoint and API key.
         </p>
 
         <div className="space-y-4">

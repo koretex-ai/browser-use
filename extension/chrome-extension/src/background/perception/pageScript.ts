@@ -227,9 +227,10 @@ export function extractPageText(maxChars: number): string {
       },
     });
     // Recurse into open shadow roots (walker does not descend into them)
-    const shadowHosts = (root instanceof Element || root instanceof Document || root instanceof ShadowRoot
-      ? Array.from((root as Element).querySelectorAll?.('*') ?? [])
-      : []
+    const shadowHosts = (
+      root instanceof Element || root instanceof Document || root instanceof ShadowRoot
+        ? Array.from((root as Element).querySelectorAll?.('*') ?? [])
+        : []
     ).filter(el => (el as Element).shadowRoot) as Element[];
 
     let node: Node | null;
@@ -291,7 +292,7 @@ export function clickElementByIndex(index: number): { ok: boolean; error?: strin
         match = node;
         break;
       }
-      node = node.parentNode ?? ((node.getRootNode() as ShadowRoot | Document) as ShadowRoot).host ?? null;
+      node = node.parentNode ?? (node.getRootNode() as ShadowRoot | Document as ShadowRoot).host ?? null;
       if (node instanceof ShadowRoot) node = node.host;
     }
     el = match ?? (hit as HTMLElement);
@@ -392,7 +393,7 @@ export function clickAtPoint(x: number, y: number): { ok: boolean; error?: strin
       el = node;
       break;
     }
-    node = node.parentNode ?? ((node.getRootNode() as ShadowRoot | Document) as ShadowRoot).host ?? null;
+    node = node.parentNode ?? (node.getRootNode() as ShadowRoot | Document as ShadowRoot).host ?? null;
     if (node instanceof ShadowRoot) node = node.host;
   }
 

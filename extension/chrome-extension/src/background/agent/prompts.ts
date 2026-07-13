@@ -54,7 +54,8 @@ export function formatPageState(state: PerceptionSnapshot | null, pageTextChars 
     const kind = el.role && el.role !== el.tag ? `${el.tag}:${el.role}` : el.tag;
     return `[${el.index}]<${kind}> ${label}`.trim();
   });
-  const truncated = state.elements.length > MAX_ELEMENTS ? `\n(+${state.elements.length - MAX_ELEMENTS} more below)` : '';
+  const truncated =
+    state.elements.length > MAX_ELEMENTS ? `\n(+${state.elements.length - MAX_ELEMENTS} more below)` : '';
   const scrollInfo =
     state.scroll.pageHeight > state.scroll.viewportHeight
       ? ` | scroll ${state.scroll.y}/${state.scroll.pageHeight - state.scroll.viewportHeight}px`

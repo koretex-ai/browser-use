@@ -105,7 +105,9 @@ const BookmarkList: React.FC<BookmarkListProps> = ({
                   value={editTitle}
                   onChange={e => setEditTitle(e.target.value)}
                   className={`mr-2 grow rounded px-2 py-1 text-sm ${
-                    isDarkMode ? 'border-[#1F7A4A]/50 bg-[#12251A] text-gray-200' : 'border-sky-100 bg-white text-gray-700'
+                    isDarkMode
+                      ? 'border-[#1F7A4A]/50 bg-[#12251A] text-gray-200'
+                      : 'border-sky-100 bg-white text-gray-700'
                   } border`}
                 />
                 <button

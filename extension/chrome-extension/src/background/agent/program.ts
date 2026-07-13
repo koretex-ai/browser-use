@@ -233,13 +233,7 @@ export async function runProgramSubtask(
         return executeAction(tabId, taskId, { type: 'key', combo: step.combo }, lastState, logContextFor(step));
       case 'type_focused':
         if (!step.text) return { ok: false, message: 'type_focused step has no text' };
-        return executeAction(
-          tabId,
-          taskId,
-          { type: 'type_focused', text: step.text },
-          lastState,
-          logContextFor(step),
-        );
+        return executeAction(tabId, taskId, { type: 'type_focused', text: step.text }, lastState, logContextFor(step));
       case 'wait':
         await sleep(Math.min(step.ms ?? 1000, 10000));
         return { ok: true, message: `waited ${step.ms ?? 1000}ms` };
@@ -286,13 +280,7 @@ export async function runProgramSubtask(
         if (!state) return { ok: false, message: 'could not read the page to locate the input' };
         const index = resolveTarget(state, step.target);
         if (index === null) return { ok: false, message: `no input element matching "${step.target}"` };
-        return executeAction(
-          tabId,
-          taskId,
-          { type: 'type', index, text: step.text },
-          state,
-          logContextFor(step),
-        );
+        return executeAction(tabId, taskId, { type: 'type', index, text: step.text }, state, logContextFor(step));
       }
       case 'extract': {
         if (!step.query) return { ok: false, message: 'extract step has no query' };
@@ -364,9 +352,7 @@ export async function runProgramSubtask(
         );
       }
     }
-    const dataNote = collected.length
-      ? ` Collected data:\n${collected.slice(-4).join('\n').slice(0, 1200)}`
-      : '';
+    const dataNote = collected.length ? ` Collected data:\n${collected.slice(-4).join('\n').slice(0, 1200)}` : '';
     return await finalize('ok', `All ${Math.min(steps.length, MAX_PROGRAM_STEPS)} program steps completed.${dataNote}`);
   } catch (error) {
     if (signal.aborted) throw error;
