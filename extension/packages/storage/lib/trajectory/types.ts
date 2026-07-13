@@ -109,7 +109,7 @@ export interface TaskRecord {
   id: string;
   sessionId: string;
   task: string;
-  mode: 'local' | 'chat' | 'execute' | 'plan';
+  mode: 'local' | 'chat' | 'execute' | 'plan' | 'recipe';
   outcome: 'ok' | 'fail' | 'cancel';
   answer: string;
   replans: number;

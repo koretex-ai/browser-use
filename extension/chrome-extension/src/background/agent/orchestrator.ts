@@ -83,10 +83,31 @@ export interface SubtaskOutcome {
 }
 
 export interface TriageResult {
-  mode: 'chat' | 'execute' | 'plan';
+  mode: 'chat' | 'execute' | 'plan' | 'recipe';
   /** Direct answer for mode=chat */
   reply?: string;
   /** Ordered subtasks for mode=plan */
+  subtasks?: Subtask[];
+  /** Matched recipe for mode=recipe */
+  recipeId?: string;
+  /** Values for the recipe's declared params, filled from the task */
+  params?: Record<string, string>;
+}
+
+/**
+ * What the parameterize call returns after a successful cold run: the
+ * executed plan with task-specific literals replaced by {param} placeholders,
+ * ready to store as a recipe (or save=false for one-off tasks).
+ */
+export interface RecipeCandidate {
+  save: boolean;
+  /** Kebab-case handle, e.g. "post-to-linkedin" */
+  name?: string;
+  /** Primary site, e.g. "linkedin.com" */
+  site?: string;
+  /** One-line description of what the recipe accomplishes */
+  intent?: string;
+  params?: { name: string; description: string }[];
   subtasks?: Subtask[];
 }
 
@@ -130,10 +151,11 @@ Canvas editors (Google Docs/Sheets): the editor is ALREADY FOCUSED when the docu
 const TRIAGE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent that runs in a Chrome side panel. You compile the user's task into subtask PROGRAMS that a deterministic runtime executes against the user's active tab. Local models handle perception (locating described elements, reading page text) but do not make decisions. You never see the page yourself — plan from the task alone.
 
 Classify the user's request and reply ONLY with a JSON object:
-{"mode": "chat" | "execute" | "plan", "reply": "<answer for chat>", "subtasks": [{"goal": "...", "success": "...", "steps": [...]}]}
+{"mode": "chat" | "execute" | "plan" | "recipe", "reply": "<answer for chat>", "subtasks": [{"goal": "...", "success": "...", "steps": [...]}], "recipeId": "<id>", "params": {"<name>": "<value>"}}
 
 - "chat": no browser needed (questions, conversation). Leave "reply" empty — the answer is streamed by a separate call with full conversation history.
 - "execute": ONE atomic browser action (e.g. "open site X"). Reply with a single subtask containing that one step.
+- "recipe": ONLY when a RECIPE LIBRARY section is present and one of its recipes matches the task's site AND intent. Reply with the recipe's id and EVERY declared param filled with the real value from the user's task (compose the content yourself when the task implies it, e.g. write the actual post text). A recipe is a saved program from a previous successful run — reusing it is far cheaper and more reliable than planning again, so prefer a genuine match over planning. But never force one: a different site, or the same site with a different intent, is NOT a match.
 - "plan": everything else. Decompose into 2-12 ordered subtasks. Group related steps into a subtask (e.g. one subtask = "search X and collect authors" with navigate+harvest steps); you are checkpointed after each subtask with evidence of the resulting page state.
 
 ${STEP_FORMS}
@@ -284,7 +306,8 @@ async function callOrchestrator<T>(
           'That was not valid JSON. Reply ONLY with the JSON object in the specified format — no prose, no code fences.',
       },
     ]);
-    const sum = (a: number | null, b: number | null): number | null => (a === null && b === null ? null : (a ?? 0) + (b ?? 0));
+    const sum = (a: number | null, b: number | null): number | null =>
+      a === null && b === null ? null : (a ?? 0) + (b ?? 0);
     const usage: CallUsage = {
       model: retry.usage.model,
       cost: sum(first.usage.cost, retry.usage.cost),
@@ -298,19 +321,55 @@ async function callOrchestrator<T>(
 export async function triageTask(
   task: string,
   signal: AbortSignal,
+  recipeDigest?: string[],
 ): Promise<{ result: TriageResult; usage: CallUsage }> {
+  const librarySection = recipeDigest?.length
+    ? `\n\nRECIPE LIBRARY (saved programs from previous successful runs):\n${recipeDigest.join('\n')}`
+    : '';
   const { value: result, usage } = await callOrchestrator<TriageResult>(
     TRIAGE_SYSTEM_PROMPT,
-    `TASK: ${task}`,
+    `TASK: ${task}${librarySection}`,
     signal,
   );
-  if (!['chat', 'execute', 'plan'].includes(result.mode)) {
+  if (!['chat', 'execute', 'plan', 'recipe'].includes(result.mode)) {
     throw new Error(`Orchestrator returned invalid mode: ${String(result.mode)}`);
   }
   if (result.mode === 'plan' && (!Array.isArray(result.subtasks) || result.subtasks.length === 0)) {
     // A plan with no subtasks degrades to direct execution
     return { result: { mode: 'execute' }, usage };
   }
+  return { result, usage };
+}
+
+const RECIPE_SAVE_SYSTEM_PROMPT = `You are the orchestrator for a browser agent. A task just completed successfully. You get the task and the EXECUTED PLAN — the subtask programs that actually ran, including any mid-run corrections. Decide whether this is a reusable pattern worth saving as a RECIPE: a parameterized program that future matching tasks re-run directly instead of being planned again.
+
+Reply ONLY with a JSON object:
+{"save": true|false, "name": "<kebab-case, e.g. post-to-linkedin>", "site": "<primary domain, e.g. linkedin.com>", "intent": "<one line: what the recipe accomplishes>", "params": [{"name": "message", "description": "the text to post"}], "subtasks": [{"goal": "...", "success": "...", "steps": [...]}]}
+
+Parameterization rules:
+- Replace every TASK-SPECIFIC literal (post/message text, search queries, names, dates, counts, document titles) in goals, success criteria and step fields with {param} placeholders, and declare each one in "params" with a description of what fills it. Text composed for THIS task is a param; do not bake it in.
+- Keep SITE-STRUCTURE literals exactly as-is: URLs (parameterize only the query part when it carries a task value), element labels, key combos, wait times. These are the site lore that makes the recipe work.
+- Search-results URLs with an embedded query become a param inside the URL, e.g. "https://x.com/search?q={query}".
+- Numeric harvest targets ("until") may become a {count} param when the task chose the number.
+- Keep the subtask structure and step order exactly as executed — the program is verified to work; do not redesign it.
+
+save=false when the run is not a repeatable pattern: one-off research whose value was the answer itself, tasks tied to ephemeral page state, or plans that only worked through heavy improvisation (mostly goal-only subtasks without steps). save=true for action patterns likely to recur: posting/sending, form filling, collect-N-from-a-feed, create-document workflows.`;
+
+/**
+ * Post-success parameterize call: turn the executed plan into a recipe
+ * candidate. Standard model — it rewrites a verified program, no diagnosis.
+ */
+export async function parameterizeRecipe(
+  task: string,
+  executedPlan: Subtask[],
+  signal: AbortSignal,
+): Promise<{ result: RecipeCandidate; usage: CallUsage }> {
+  const userContent = `TASK: ${task}\n\nEXECUTED PLAN (JSON):\n${JSON.stringify(executedPlan, null, 1)}`;
+  const { value: result, usage } = await callOrchestrator<RecipeCandidate>(
+    RECIPE_SAVE_SYSTEM_PROMPT,
+    userContent,
+    signal,
+  );
   return { result, usage };
 }
 
@@ -403,8 +462,7 @@ export async function salvageAnswer(
   signal: AbortSignal,
   ledger?: string[],
 ): Promise<{ answer: string; usage: CallUsage }> {
-  const userContent =
-    `TASK: ${task}\n\nOUTCOMES (JSON):\n${JSON.stringify(outcomes, null, 1)}` + ledgerSection(ledger);
+  const userContent = `TASK: ${task}\n\nOUTCOMES (JSON):\n${JSON.stringify(outcomes, null, 1)}` + ledgerSection(ledger);
   const { value, usage } = await callOrchestrator<{ answer: string }>(
     SALVAGE_SYSTEM_PROMPT,
     userContent,

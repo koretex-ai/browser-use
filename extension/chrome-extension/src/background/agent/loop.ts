@@ -1,5 +1,5 @@
-import type { PerceptionSnapshot, TaskRecord } from '@extension/storage';
-import { Actors, chatSettingsStore, trajectoryStore } from '@extension/storage';
+import type { PerceptionSnapshot, TaskRecord, RecipeRecord } from '@extension/storage';
+import { Actors, chatSettingsStore, trajectoryStore, recipeStore } from '@extension/storage';
 import { createLogger } from '../log';
 import { postExecutionEvent } from '../events';
 import { capturePageState, capturePageText, clearHighlights } from '../perception';
@@ -9,15 +9,11 @@ import { streamChatReply, streamCloudChatReply } from './chat';
 import { groundTarget } from './grounder';
 import { planNextAction, validateCompletion, decisionToAction, extractFromPage, LOCAL_ENDPOINT } from './planner';
 import type { PlannerDecision, PlannerEndpoint } from './planner';
-import {
-  PLANNER_SYSTEM_PROMPT,
-  VALIDATOR_SYSTEM_PROMPT,
-  formatPlannerTurn,
-  formatValidatorTurn,
-} from './prompts';
+import { PLANNER_SYSTEM_PROMPT, VALIDATOR_SYSTEM_PROMPT, formatPlannerTurn, formatValidatorTurn } from './prompts';
 import { isOrchestratorConfigured, triageTask, checkpoint, rescueSubtask, salvageAnswer } from './orchestrator';
 import type { Subtask, SubtaskOutcome, CallUsage, ProgramStep } from './orchestrator';
 import { runProgramSubtask } from './program';
+import { recipeLibraryDigest, instantiateRecipe, parameterizeSubtask, saveRecipeCandidate } from './recipes';
 
 const logger = createLogger('agent');
 
@@ -716,7 +712,16 @@ async function runOrchestratedTask(
   const runWithRescue = async (
     subtask: Subtask,
     stepPrefix: string,
-  ): Promise<{ run: SubtaskRunResult; goal: string; replanRequest?: Subtask[] }> => {
+  ): Promise<{
+    run: SubtaskRunResult;
+    goal: string;
+    success: string;
+    /** The program that actually ran last (post-rescue) — recipe material */
+    steps?: ProgramStep[];
+    /** True when a rescue intervened (the original program needed correction) */
+    rescued: boolean;
+    replanRequest?: Subtask[];
+  }> => {
     let currentGoal = subtask.goal;
     let currentSuccess = subtask.success;
     // The program: when present, the harness executes it deterministically —
@@ -762,9 +767,7 @@ async function runOrchestratedTask(
               endpoint: escalationEndpoint(rescues - 1),
               seedHistory: [
                 ...failureMemory.slice(-4),
-                ...ledger
-                  .slice(-3)
-                  .map(entry => `DATA already collected earlier in this task: ${entry.slice(0, 300)}`),
+                ...ledger.slice(-3).map(entry => `DATA already collected earlier in this task: ${entry.slice(0, 300)}`),
                 ...retryNote,
               ],
               trackUsage: track,
@@ -777,7 +780,7 @@ async function runOrchestratedTask(
       // Rescue any non-ok outcome: 'stuck' (loops) and 'fail' (consecutive
       // failures / step budget) both mean the executor needs help
       if (run.status === 'ok' || run.status === 'streamed' || rescues >= MAX_RESCUES_PER_SUBTASK) {
-        return { run, goal: currentGoal };
+        return { run, goal: currentGoal, success: currentSuccess, steps: currentSteps, rescued: rescues > 0 };
       }
       rescues++;
       let rescueCall;
@@ -803,7 +806,7 @@ async function runOrchestratedTask(
         // A failed rescue call is not fatal — report the outcome as-is and
         // let the checkpoint decide what to do with it
         logger.warning('rescue call failed:', error);
-        return { run, goal: currentGoal };
+        return { run, goal: currentGoal, success: currentSuccess, steps: currentSteps, rescued: rescues > 1 };
       }
       const { result: rescue, usage } = rescueCall;
       const rescueMeta = track(usage);
@@ -834,7 +837,9 @@ async function runOrchestratedTask(
         currentGoal = rescue.revisedGoal || currentGoal;
         currentSuccess = rescue.revisedSuccess || currentSuccess;
         currentAtomic = false; // revised goals are compound instructions
-        retryNote = [`NOTE: a previous attempt at this goal got stuck: ${run.summary.replace(/\n/g, ' ').slice(0, 200)}`];
+        retryNote = [
+          `NOTE: a previous attempt at this goal got stuck: ${run.summary.replace(/\n/g, ' ').slice(0, 200)}`,
+        ];
         continue;
       }
       if (rescue.decision === 'replan' && rescue.subtasks?.length) {
@@ -846,19 +851,52 @@ async function runOrchestratedTask(
           `Stuck — orchestrator wants to replan${rescue.reason ? `: ${rescue.reason}` : ''}`,
           rescueMeta,
         );
-        return { run, goal: currentGoal, replanRequest: rescue.subtasks };
+        return {
+          run,
+          goal: currentGoal,
+          success: currentSuccess,
+          steps: currentSteps,
+          rescued: true,
+          replanRequest: rescue.subtasks,
+        };
       }
       // rescue says fail — surface the diagnosis as the outcome summary
       return {
         run: { ...run, status: 'fail', summary: rescue.reason || run.summary },
         goal: currentGoal,
+        success: currentSuccess,
+        steps: currentSteps,
+        rescued: true,
       };
     }
   };
 
-  const { result: triage, usage: triageUsage } = await triageTask(task, signal);
-  const triageMeta = track(triageUsage);
+  // Recipe library: saved programs from previous successful runs. Triage sees
+  // a one-line digest of each and may match instead of planning (~$0.001
+  // parameter fill vs ~$0.01-0.02 cold compile).
+  const recipes: RecipeRecord[] = await recipeStore.getAll().catch(error => {
+    logger.warning('recipe library read failed:', error);
+    return [];
+  });
+
+  const initialTriage = await triageTask(task, signal, recipeLibraryDigest(recipes));
+  let triage = initialTriage.result;
+  let triageMeta = track(initialTriage.usage);
   logger.info('triage:', JSON.stringify(triage).slice(0, 300));
+
+  // Resolve a recipe match; a hallucinated id falls back to plain triage
+  let activeRecipe: { recipe: RecipeRecord; params: Record<string, string> } | null = null;
+  if (triage.mode === 'recipe') {
+    const matched = recipes.find(r => r.id === triage.recipeId);
+    if (matched) {
+      activeRecipe = { recipe: matched, params: triage.params ?? {} };
+    } else {
+      logger.warning('triage chose an unknown recipe id, re-triaging without the library:', triage.recipeId);
+      const retriage = await triageTask(task, signal);
+      triage = retriage.result;
+      triageMeta = track(retriage.usage);
+    }
+  }
   record.mode = triage.mode;
 
   if (triage.mode === 'chat') {
@@ -880,7 +918,18 @@ async function runOrchestratedTask(
   // replan verdicts work (previously execute treated any non-done verdict as
   // a terminal failure, even when the checkpoint knew exactly how to fix it)
   let plan: Subtask[];
-  if (triage.mode === 'execute') {
+  if (activeRecipe) {
+    plan = instantiateRecipe(activeRecipe.recipe, activeRecipe.params).slice(0, MAX_SUBTASKS);
+    postExecutionEvent(
+      port,
+      Actors.SYSTEM,
+      'step.ok',
+      taskId,
+      `Recipe: ${activeRecipe.recipe.name} @ ${activeRecipe.recipe.site} — running the saved program (${plan.length} subtask${plan.length === 1 ? '' : 's'}):\n${plan.map((s, i) => `${i + 1}. ${s.goal}`).join('\n')}`,
+      triageMeta,
+    );
+    recipeStore.recordUse(activeRecipe.recipe.id).catch(error => logger.warning('recipe use record failed:', error));
+  } else if (triage.mode === 'execute') {
     // Triage supplies the single-step program when it can; goal-only fallback
     plan = triage.subtasks?.length ? triage.subtasks.slice(0, 1) : [{ goal: task, success: 'the task is complete' }];
     postExecutionEvent(
@@ -893,14 +942,41 @@ async function runOrchestratedTask(
     );
   } else {
     plan = (triage.subtasks ?? []).slice(0, MAX_SUBTASKS);
+    // Degenerate triage (e.g. recipe mode surviving the fallback) still runs
+    if (plan.length === 0) plan = [{ goal: task, success: 'the task is complete' }];
   }
   let index = 0;
+
+  // Recipe material: the final (post-rescue) program of every subtask that
+  // succeeded, in execution order — what saveRecipeCandidate parameterizes
+  const executedPlan: Subtask[] = [];
+  const maybeSaveRecipe = async () => {
+    // Cold plan-mode successes only: recipe runs record use/repairs instead,
+    // and single-action execute tasks are not worth saving
+    if (record.mode !== 'plan' || executedPlan.length === 0) return;
+    // Nothing deterministic to replay — a recipe of goal-only improvisation
+    // would re-run the unreliable path, not the verified one
+    if (!executedPlan.some(s => s.steps?.length)) return;
+    const saved = await saveRecipeCandidate(task, record.id, executedPlan, signal, track);
+    if (saved) {
+      postExecutionEvent(
+        port,
+        Actors.SYSTEM,
+        'step.ok',
+        taskId,
+        `Saved recipe: ${saved} — matching tasks will now reuse this verified program.`,
+      );
+    }
+  };
 
   const applyReplan = (subtasks: Subtask[], meta: string, label: string): boolean => {
     if (record.replans >= MAX_REPLANS) return false;
     record.replans++;
     plan = subtasks.slice(0, MAX_SUBTASKS);
     index = 0;
+    // The plan no longer maps 1:1 onto the recipe's subtasks — stop
+    // attributing outcomes (and repairs) to it
+    activeRecipe = null;
     postExecutionEvent(
       port,
       Actors.SYSTEM,
@@ -938,12 +1014,34 @@ async function runOrchestratedTask(
         );
       }
 
-      const { run, goal, replanRequest } = await runWithRescue(
+      const { run, goal, success, steps, rescued, replanRequest } = await runWithRescue(
         subtask,
         plan.length > 1 ? `[${index + 1}/${plan.length}] ` : '',
       );
       outcomes.push(toOutcome(goal, run, settings.cloudExecutorEnabled));
       rememberFailure(goal, run);
+      if (run.status === 'ok') executedPlan.push({ goal, success, steps });
+
+      // Recipe self-healing: a rescue corrected this recipe-sourced subtask's
+      // program and the correction succeeded — write the fix back (with this
+      // run's param values swapped back to placeholders)
+      const recipeRun = activeRecipe;
+      if (recipeRun && run.status === 'ok' && rescued && steps?.length && index < recipeRun.recipe.subtasks.length) {
+        const repaired = parameterizeSubtask(goal, success, steps, recipeRun.params);
+        const subtaskNumber = index + 1;
+        recipeStore
+          .repairSubtask(recipeRun.recipe.id, index, repaired)
+          .then(() =>
+            postExecutionEvent(
+              port,
+              Actors.SYSTEM,
+              'step.ok',
+              taskId,
+              `Recipe self-healed: subtask ${subtaskNumber} of "${recipeRun.recipe.name}" now uses the corrected program.`,
+            ),
+          )
+          .catch(error => logger.warning('recipe repair failed:', error));
+      }
 
       // Surface the outcome — silent false "done" claims made runs unreadable
       postExecutionEvent(
@@ -979,6 +1077,7 @@ async function runOrchestratedTask(
       logger.info('checkpoint:', JSON.stringify(verdict).slice(0, 300));
 
       if (verdict.decision === 'done') {
+        await maybeSaveRecipe();
         finishOk(verdict.answer || 'Task complete.', checkpointMeta);
         return 'finished';
       }
@@ -1018,6 +1117,7 @@ async function runOrchestratedTask(
     const { result: final, usage: finalUsage } = finalCall;
     const finalMeta = track(finalUsage);
     if (final.decision === 'done') {
+      await maybeSaveRecipe();
       finishOk(final.answer || 'Task complete.', finalMeta);
       return;
     }
