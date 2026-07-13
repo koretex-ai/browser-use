@@ -71,6 +71,27 @@ export function degenerateExpectReason(expect: StepExpect): string | null {
   return null;
 }
 
+// The substring cousin of {see:"yes"}: a SUBMIT/SEND/CREATE step whose only
+// proof is text that an EARLIER step already typed onto the page. That text was
+// present the moment it was typed — before the submit — so the check passes
+// whether or not the action succeeded (the x.com "posted hello world" false
+// positive). A transition field (url/element/see) that only success produces
+// rescues it; text-alone against already-entered content does not.
+export function weakSideEffectExpectReason(expect: StepExpect, priorTypedTexts: string[]): string | null {
+  if (!expect.text) return null;
+  // A url/element/see field checks a transition — that makes the expect real
+  if (expect.url || expect.element || expect.see) return null;
+  const wanted = normalize(expect.text);
+  if (!wanted) return null;
+  for (const typed of priorTypedTexts) {
+    const t = normalize(typed);
+    if (t && (t.includes(wanted) || wanted.includes(t))) {
+      return `the expect only checks that "${expect.text.slice(0, 40)}" is on the page, but an earlier step typed that content — it is already true before this action, so it cannot prove the action happened; verify the TRANSITION instead (the dialog/composer closed, a confirmation appeared, or the item now shows in the feed/list)`;
+    }
+  }
+  return null;
+}
+
 // Check the deterministic fields against one snapshot; null = all hold
 function deterministicFailure(state: PerceptionSnapshot, expect: StepExpect): string | null {
   if (expect.url && !state.url.toLowerCase().includes(expect.url.toLowerCase())) {

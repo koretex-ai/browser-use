@@ -7,7 +7,13 @@ import { streamCloudChatReply } from './chat';
 import { planTask, reflectOnFailure, reportOutcome, curateCollection } from './orchestrator';
 import type { ProgramStep, CallUsage } from './orchestrator';
 import { createStepRunner, describeStep, listLines, itemKey } from './program';
-import { verifyExpect, describeExpect, hasExpectation, degenerateExpectReason } from './verifier';
+import {
+  verifyExpect,
+  describeExpect,
+  hasExpectation,
+  degenerateExpectReason,
+  weakSideEffectExpectReason,
+} from './verifier';
 
 const logger = createLogger('pav');
 
@@ -329,17 +335,35 @@ export async function runPavTask(
       // no expect; or a DEGENERATE expect (e.g. {"see":"yes"}) that would pass
       // vacuously. Verification only means something if the expects are real.
       const expectFaults: string[] = [];
+      // Literal text entered by type/type_focused steps SO FAR — a later
+      // side-effect step (or the objective) that only checks this text back is
+      // verification theater (it was true before the submit). textFrom:collected
+      // is data, not user-entered content, so it does not count.
+      const typedSoFar: string[] = [];
       for (const [i, step] of steps.entries()) {
         if (STATE_CHANGING.has(step.do) && !hasExpectation(step.expect)) {
           expectFaults.push(`step ${i + 1} (${describeStep(step)}) has no expect`);
         } else if (step.expect) {
           const degenerate = degenerateExpectReason(step.expect);
           if (degenerate) expectFaults.push(`step ${i + 1}: ${degenerate}`);
+          // Only a side-effect step is suspect: a plain type step verifying its
+          // OWN text landed is legitimate proof the typing worked
+          else if (step.sideEffect) {
+            const weak = weakSideEffectExpectReason(step.expect, typedSoFar);
+            if (weak) expectFaults.push(`step ${i + 1} (${describeStep(step)}): ${weak}`);
+          }
+        }
+        if ((step.do === 'type' || step.do === 'type_focused') && step.text && step.textFrom !== 'collected') {
+          typedSoFar.push(step.text);
         }
       }
       for (const [i, expect] of objective.entries()) {
         const degenerate = degenerateExpectReason(expect);
         if (degenerate) expectFaults.push(`objective check ${i + 1}: ${degenerate}`);
+        else {
+          const weak = weakSideEffectExpectReason(expect, typedSoFar);
+          if (weak) expectFaults.push(`objective check ${i + 1}: ${weak}`);
+        }
       }
       const invalid = steps.length === 0 ? 'the plan has no steps' : expectFaults.join('; ');
       if (invalid) {
