@@ -36,6 +36,13 @@ export interface StepExpect {
   text?: string;
   /** Label of an interactive element that must exist */
   element?: string;
+  /**
+   * A label/text that must NO LONGER be present — the "disappeared" half of a
+   * transition (a dialog/composer closed, an item deleted, a spinner gone).
+   * Deterministic, polled. This is how a submit/close/delete is proven without
+   * vision.
+   */
+  gone?: string;
   /** Yes/no question for the local vision verifier (canvas editors, layout) */
   see?: string;
 }
@@ -124,11 +131,12 @@ Targets are element DESCRIPTIONS (visible text labels), resolved on the live pag
 EXPECTS — every state-changing step (navigate, click, type, type_focused, key) MUST carry "expect", the observable postcondition that proves the step worked:
 "expect": {"url": "<substring the URL will contain>"}
 "expect": {"text": "<text that will appear on the page>"}
-"expect": {"element": "<label of an element that will exist>"}
+"expect": {"element": "<label of an element that will now exist>"}
+"expect": {"gone": "<label/text that will NO LONGER be present>"}  (the disappeared half of a transition: a dialog/composer closed, an item deleted, a spinner finished)
 "expect": {"see": "<yes/no question for a local vision model>"}
-Fields combine (all must hold). Prefer url/text/element — they are checked instantly against the live page and POLL for up to ~8 seconds, so you never need wait steps after navigation: the expect IS the wait. Use "see" ONLY for canvas editors (Google Docs/Sheets, where page text cannot see the document content) or purely visual outcomes — it costs a slow local vision call. Read-only steps (extract, harvest, scroll, wait, wait_for) may omit expect.
+Fields combine (all must hold). url/text/element/gone are deterministic — checked instantly against the live page and POLLED up to ~8 seconds, so you never need wait steps after navigation: the expect IS the wait. "see" is for outcomes only a screenshot can judge (canvas editors like Google Docs/Sheets; a purely visual layout) — it is the RIGHT tool for a visual-only transition, just slower, so reach for a deterministic field first when one captures the transition. Read-only steps (extract, harvest, scroll, wait, wait_for) may omit expect.
 
-AN EXPECT MUST BE SATISFIABLE ONLY BY SUCCESS — never by a state that is ALREADY TRUE before the step completes. The test: could this expect pass even if the action did nothing? If yes, it is worthless. In particular, verifying that content you just entered is still on the page does NOT prove it was submitted — that text was there the moment you typed it. For an action that SUBMITS / SENDS / CREATES / DELETES, verify the TRANSITION that only success produces: the input surface cleared or the dialog closed, a confirmation appeared, the new item now shows in the list/feed, or the deleted item is gone. E.g. after posting, expect the composer dialog is gone AND the post appears in the timeline — NOT that the post text is somewhere on the page. The OBJECTIVE expects follow the same rule: they must describe the delivered outcome, checkable only after it truly happened.
+AN EXPECT MUST BE SATISFIABLE ONLY BY SUCCESS — never by a state that is ALREADY TRUE before the step completes. The test: could this expect pass even if the action did nothing? If yes, it is worthless. In particular, verifying that content you just entered is still on the page does NOT prove it was submitted — that text was there the moment you typed it. For an action that SUBMITS / SENDS / CREATES / DELETES, verify the TRANSITION that only success produces — most reliably with "gone" (the input surface or dialog closed) and/or a confirmation "element" that only appears afterwards. E.g. after posting, the composer is gone: {"gone": "<the composer's placeholder or submit label>"}. Do NOT verify a submit by the persistence of the text you typed. The OBJECTIVE expects follow the same rule: they must describe the delivered outcome, checkable only after it truly happened.
 
 SIDE EFFECTS — steps that post, send, submit a form, purchase, or delete MUST carry "sideEffect": true (the runtime never auto-retries them) AND their expect must verify the post-action transition above, never the persistence of the entered content.
 

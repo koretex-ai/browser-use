@@ -384,12 +384,15 @@ export async function runPavTask(
         note(
           `plan ${plansUsed} rejected by the runtime: ${invalid}. Emit a DIFFERENT plan that fixes this — do not repeat the rejected step or objective. Every state-changing step needs a REAL, specific expect, and side-effect/objective expects must verify the transition only success produces, not content already on the page.`,
         );
+        // Show the rejected plan's steps too — otherwise a message like
+        // "step 4: ..." references a plan the user never saw
+        const rejectedSteps = steps.map((s, n) => `${n + 1}. ${describeStep(s)}`).join('\n');
         postExecutionEvent(
           port,
           Actors.SYSTEM,
           'step.ok',
           taskId,
-          `Plan rejected (${invalid}) — replanning.`,
+          `Plan ${plansUsed} rejected — replanning.\n${rejectedSteps}\nReason: ${invalid}`,
           planMeta,
         );
         if (repeated) {

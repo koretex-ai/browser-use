@@ -42,12 +42,13 @@ export function describeExpect(expect: StepExpect): string {
   if (expect.url) parts.push(`url~"${expect.url}"`);
   if (expect.text) parts.push(`text "${expect.text.slice(0, 60)}"`);
   if (expect.element) parts.push(`element "${expect.element.slice(0, 40)}"`);
+  if (expect.gone) parts.push(`gone "${expect.gone.slice(0, 40)}"`);
   if (expect.see) parts.push(`see: "${expect.see.slice(0, 60)}"`);
   return parts.join(' & ') || '(no expect)';
 }
 
 export function hasExpectation(expect?: StepExpect): boolean {
-  return Boolean(expect && (expect.url || expect.text || expect.element || expect.see));
+  return Boolean(expect && (expect.url || expect.text || expect.element || expect.gone || expect.see));
 }
 
 // Degenerate expects are the loophole a lazy planner finds: {"see":"yes"} asks
@@ -79,14 +80,14 @@ export function degenerateExpectReason(expect: StepExpect): string | null {
 // rescues it; text-alone against already-entered content does not.
 export function weakSideEffectExpectReason(expect: StepExpect, priorTypedTexts: string[]): string | null {
   if (!expect.text) return null;
-  // A url/element/see field checks a transition — that makes the expect real
-  if (expect.url || expect.element || expect.see) return null;
+  // A url/element/gone/see field checks a transition — that makes the expect real
+  if (expect.url || expect.element || expect.gone || expect.see) return null;
   const wanted = normalize(expect.text);
   if (!wanted) return null;
   for (const typed of priorTypedTexts) {
     const t = normalize(typed);
     if (t && (t.includes(wanted) || wanted.includes(t))) {
-      return `the expect only checks that "${expect.text.slice(0, 40)}" is on the page, but an earlier step typed that content — it is already true before this action, so it cannot prove the action happened; verify the TRANSITION instead (the dialog/composer closed, a confirmation appeared, or the item now shows in the feed/list)`;
+      return `the expect only checks that "${expect.text.slice(0, 40)}" is on the page, but a step earlier in THIS plan typed that same content — so it is already true before this click and cannot prove the action happened; verify the TRANSITION instead: add "gone" (the composer/dialog closed), an "element" that only appears on success (a confirmation), or a "see" question`;
     }
   }
   return null;
@@ -109,6 +110,15 @@ function deterministicFailure(state: PerceptionSnapshot, expect: StepExpect): st
       .join(', ');
     return `no element matching "${expect.element}" — visible elements include: ${labels || '(none)'}`;
   }
+  if (expect.gone) {
+    // The disappearance is proven only when NEITHER an element NOR the page
+    // text still carries it
+    const stillElement = resolveTarget(state, expect.gone) !== null;
+    const stillText = normalize(state.pageText ?? '').includes(normalize(expect.gone));
+    if (stillElement || stillText) {
+      return `"${expect.gone}" is still present (expected it to be gone) — page is "${state.title}" at ${state.url}`;
+    }
+  }
   return null;
 }
 
@@ -120,7 +130,7 @@ export async function verifyExpect(
 ): Promise<VerifyResult> {
   if (!hasExpectation(expect)) return { pass: true, observation: 'no expect specified' };
 
-  const hasDeterministic = Boolean(expect.url || expect.text || expect.element);
+  const hasDeterministic = Boolean(expect.url || expect.text || expect.element || expect.gone);
   const deadline = Date.now() + timeoutMs;
   let lastFailure = 'could not read the page';
 
