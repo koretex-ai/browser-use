@@ -101,7 +101,27 @@ export function getLastSnapshot(): PerceptionSnapshot | null {
   return lastSnapshot;
 }
 
+// A deterministic settle gate: url expects verify off the TAB (instantly, by
+// design), so the step AFTER a navigate reaches perception while a heavy SPA
+// is still booting — script injection then stalls into the 12s timeout and
+// the whole step "fails" on a page that was merely loading. Waiting for the
+// tab's load event first is cheap, deterministic, and bounded. SPA rendering
+// can lag the load event, but injection itself is reliable from then on.
+const TAB_LOAD_WAIT_MS = 15_000;
+async function waitForTabLoad(tabId: number): Promise<void> {
+  const deadline = Date.now() + TAB_LOAD_WAIT_MS;
+  for (;;) {
+    const status = await chrome.tabs
+      .get(tabId)
+      .then(t => t.status)
+      .catch(() => 'complete');
+    if (status === 'complete' || Date.now() >= deadline) return;
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+}
+
 export async function capturePageState(tabId: number, showHighlights: boolean): Promise<PerceptionSnapshot> {
+  await waitForTabLoad(tabId);
   const dom: ExtractedPageState = await runInPage(tabId, extractInteractiveElements, showHighlights);
   if (!dom) throw new Error('DOM extraction returned no result — is this a restricted page (chrome://, Web Store)?');
 
@@ -109,7 +129,14 @@ export async function capturePageState(tabId: number, showHighlights: boolean): 
     logger.warning('page text extraction failed:', error);
     return '';
   });
-  const screenshot = await captureScreenshot(tabId);
+  // Pixels are optional for a usable snapshot: DOM + text serve target
+  // resolution and deterministic checks. Screenshot failures (quota, race
+  // with a closing dialog) degrade the snapshot, never void it — only steps
+  // that truly need pixels (grounding, `see`) capture their own and may fail.
+  const screenshot = await captureScreenshot(tabId).catch(error => {
+    logger.warning('snapshot screenshot failed (continuing without pixels):', error);
+    return { dataUrl: '', width: 0, height: 0 };
+  });
   logger.info('captured page state', dom.url, `${dom.elements.length} elements, ${pageText.length} text chars`);
 
   lastSnapshot = {
@@ -127,6 +154,7 @@ export async function capturePageState(tabId: number, showHighlights: boolean): 
 /** Full-budget page text for the extract action (never leaves the machine
  * unless the cloud-executor fallback is enabled). */
 export async function capturePageText(tabId: number): Promise<string> {
+  await waitForTabLoad(tabId);
   return runInPage(tabId, extractPageText, EXTRACT_PAGE_TEXT_CHARS);
 }
 

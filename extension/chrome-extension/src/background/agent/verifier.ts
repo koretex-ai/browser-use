@@ -142,6 +142,7 @@ export async function verifyExpect(
   const needsPerception = Boolean(expect.text || expect.element || expect.gone);
   const deadline = Date.now() + timeoutMs;
   let lastFailure = '';
+  let lastReadError = '';
   let gotState = false;
 
   if (expect.url || needsPerception) {
@@ -163,7 +164,10 @@ export async function verifyExpect(
 
       let contentOk = true;
       if (needsPerception) {
-        const state = await capturePageState(tabId, false).catch(() => null);
+        const state = await capturePageState(tabId, false).catch(error => {
+          lastReadError = error instanceof Error ? error.message : String(error);
+          return null;
+        });
         if (state) {
           gotState = true;
           const failure = contentFailure(state, expect);
@@ -184,7 +188,7 @@ export async function verifyExpect(
           return {
             pass: false,
             inconclusive: true,
-            observation: `could not read the page to verify (${describeExpect(expect)}) — this is a perception/tooling problem, not proof the step failed; the action may have worked`,
+            observation: `could not read the page to verify (${describeExpect(expect)})${lastReadError ? ` — ${lastReadError}` : ''} — this is a perception/tooling problem, not proof the step failed; the action may have worked`,
           };
         }
         logger.info('verify fail:', lastFailure.slice(0, 160));

@@ -197,14 +197,24 @@ export function createStepRunner(
   let lastState: PerceptionSnapshot | null = null;
   const history: string[] = [];
 
+  // Why the last perceive() returned null — surfaced verbatim in step-failure
+  // messages so the reflector (and the transcript) sees the actual cause
+  // ("reading the page timed out after 12s") instead of a generic shrug
+  let lastPerceiveError = '';
   const perceive = async (): Promise<PerceptionSnapshot | null> => {
     const state = await capturePageState(tabId, false).catch(async () => {
       await sleep(1500);
-      return capturePageState(tabId, false).catch(() => null);
+      return capturePageState(tabId, false).catch(error => {
+        lastPerceiveError = error instanceof Error ? error.message : String(error);
+        return null;
+      });
     });
     lastState = state ?? lastState;
+    if (state) lastPerceiveError = '';
     return state;
   };
+  const readFailure = (what: string) =>
+    `could not read the page to locate the ${what}${lastPerceiveError ? ` (${lastPerceiveError})` : ''}`;
 
   const logContextFor = (step: ProgramStep) => ({
     subtaskId: ctx.runId,
@@ -341,7 +351,7 @@ export function createStepRunner(
       case 'click': {
         if (!step.target) return { ok: false, message: 'click step has no target' };
         const state = await perceive();
-        if (!state) return { ok: false, message: 'could not read the page to locate the target' };
+        if (!state) return { ok: false, message: readFailure('target') };
         const match = resolveTargetDetail(state, step.target);
         // Use the DOM match only when it is confident AND unambiguous. A near-
         // tie between distinct elements (two "Post" buttons) goes to vision,
@@ -371,7 +381,7 @@ export function createStepRunner(
         const text = resolveStepText(step);
         if (!step.target || !text) return { ok: false, message: 'type step needs target and text' };
         const state = await perceive();
-        if (!state) return { ok: false, message: 'could not read the page to locate the input' };
+        if (!state) return { ok: false, message: readFailure('input') };
         const match = resolveTargetDetail(state, step.target);
         if (match.index !== null && !match.ambiguous) {
           return executeAction(tabId, taskId, { type: 'type', index: match.index, text }, state, logContextFor(step));
