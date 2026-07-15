@@ -147,19 +147,17 @@ export async function cdpKey(tabId: number, combo: string): Promise<void> {
 /**
  * Type text into whatever currently has keyboard focus, as trusted input.
  * Newlines become real Enter presses (Input.insertText does not translate
- * them). Works in canvas editors (Google Docs/Sheets) that ignore synthetic
- * DOM events.
+ * them); tabs are typed as-is (grid column moves). Works in canvas editors
+ * (Google Docs/Sheets) that ignore synthetic DOM events.
  *
- * REPLACE semantics, not append: select-all first so the initial insert
- * overwrites any existing content. This makes the step IDEMPOTENT — a retry
- * or a reflect-correction re-types cleanly instead of doubling the text
- * ("hello worldhello world"). Select-all on an empty editor is a no-op.
+ * INSERT semantics — no automatic select-all. The old idempotency trick
+ * (Cmd+A before typing) selected ALL CELLS in a spreadsheet GRID instead of
+ * text, so nothing was ever typed (live failure 2026-07-15: an entire Sheets
+ * write landed nowhere while the selection showed 1:1000). Clean-state
+ * before a redo is now the navigator's decision — it can SEE leftovers on
+ * the screenshot and clear them explicitly.
  */
 export async function cdpTypeFocused(tabId: number, text: string): Promise<void> {
-  // Cmd+A selects the focused editor's content; the first insertText below
-  // replaces the selection. (macOS — the dev target; Meta is the select-all
-  // modifier.)
-  await cdpKey(tabId, 'Meta+A').catch(() => {});
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
     if (lines[i]) await send(tabId, 'Input.insertText', { text: lines[i] });

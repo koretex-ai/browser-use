@@ -93,8 +93,16 @@ function elementsDigestOf(state: PerceptionSnapshot | null): string[] {
 // Action skeleton for the repeat-decision guard (free text ignored: a
 // decision that only rewords its typing is still the same decision)
 function actionFingerprint(step: ProgramStep): string {
-  return JSON.stringify([step.do, step.url ?? '', step.target ?? '', step.query ?? '']);
+  return JSON.stringify([step.do, step.url ?? '', step.target ?? '', step.query ?? '', step.items?.[0] ?? '']);
 }
+
+// Futility window: how many recent executed steps to remember, and how many
+// repeats of one action inside it count as pacing (a loop made of local
+// successes — scroll up, scroll down, scroll up — that no failure signal sees)
+const FUTILITY_WINDOW = 8;
+const FUTILITY_REPEATS = 3;
+// Same action judged "uncertain" (no visible effect) this many times = stuck
+const UNCERTAIN_REPEATS = 2;
 
 // Submit-looking click/key targets must declare sideEffect explicitly — an
 // unmarked submit would get the transient-retry treatment and could fire
@@ -328,6 +336,9 @@ export async function runStepwiseTask(
   // launder a failed action back into eligibility)
   const failedCounts = new Map<string, number>();
   const failedSideEffectContexts = new Set<string>();
+  // Futility memory — cleared when a strategic review sets new orders
+  const uncertainCounts = new Map<string, number>();
+  const recentFingerprints: string[] = [];
   let consecutiveFailures = 0;
   let decidedAny = false;
   let outcome: 'ok' | 'fail' | null = null;
@@ -419,6 +430,8 @@ export async function runStepwiseTask(
     // Fresh start under new orders
     consecutiveFailures = 0;
     rejections = 0;
+    uncertainCounts.clear();
+    recentFingerprints.length = 0;
     note(
       `STRATEGIC REVIEW (${stuckSignal.slice(0, 80)}): ${(review.diagnosis ?? '').slice(0, 140)} → new strategy in force`,
     );
@@ -509,6 +522,15 @@ export async function runStepwiseTask(
           }
         } else if (verdict === 'succeeded') {
           consecutiveFailures = 0;
+        } else if (verdict === 'uncertain') {
+          // "Uncertain" repeated on the SAME action is stuckness too — six
+          // identical no-visible-effect clicks once went undetected because
+          // only failures counted
+          const n = (uncertainCounts.get(lastAction.fingerprint) ?? 0) + 1;
+          uncertainCounts.set(lastAction.fingerprint, n);
+          if (n >= UNCERTAIN_REPEATS) {
+            stuckSignal = `the same action has been judged uncertain (no visible effect) ${n} times: ${lastAction.description.slice(0, 100)}`;
+          }
         }
         // Failed OR uncertain side effects may have landed — same-page
         // re-issue is off the table for the rest of the run
@@ -682,6 +704,26 @@ export async function runStepwiseTask(
         continue;
       }
 
+      // Pacing detector: the same action recurring in the recent window —
+      // even when every occurrence "succeeded" — is a loop no failure signal
+      // sees (live case: 27 steps of scroll-up/scroll-down/extract circling)
+      const windowRepeats = recentFingerprints.filter(fp => fp === fingerprint).length;
+      if (windowRepeats >= FUTILITY_REPEATS && reviewsUsed < MAX_REVIEWS && !outOfTime()) {
+        note(
+          `pacing detected: "${describeStep(step)}" chosen ${windowRepeats + 1} times in the last ${FUTILITY_WINDOW} steps without the task advancing`,
+        );
+        const outcomeOfReview = await runReview(
+          `the run is pacing — the same action (${describeStep(step).slice(0, 80)}) keeps recurring without the task advancing`,
+          observed,
+        );
+        if (outcomeOfReview === 'ended') {
+          outcome = record.outcome === 'ok' ? 'ok' : 'fail';
+          outcomeSummary = 'ended by strategic review';
+          return;
+        }
+        continue;
+      }
+
       // Decision accepted — an executed step resets the invalid-decision streak
       rejections = 0;
       stepsUsed++;
@@ -694,6 +736,42 @@ export async function runStepwiseTask(
         `Step ${stepsUsed}: ${description}${decision.why ? ` — ${decision.why.slice(0, 120)}` : ''}`,
         decideMeta,
       );
+
+      recentFingerprints.push(fingerprint);
+      if (recentFingerprints.length > FUTILITY_WINDOW) recentFingerprints.shift();
+
+      // ---- VISION-COLLECT (handled by the conductor, no browser action) ----
+      // The navigator records data it read off the SCREENSHOT — the strong
+      // model's eyes replace the local DOM reader for small collections
+      // (which returns garbled fragments on some heavy SPAs, e.g. x.com)
+      if (step.do === 'collect') {
+        const items = (step.items ?? []).map(item => String(item).trim()).filter(Boolean);
+        if (items.length === 0) {
+          rejections++;
+          note('collect step rejected: it carried no items');
+          if (rejections >= MAX_REJECTIONS) {
+            await report('partial', 'The navigator kept returning invalid steps.');
+            outcome = 'fail';
+            outcomeSummary = 'invalid steps';
+            return;
+          }
+          continue;
+        }
+        const before = collection.length;
+        recordExtract('collected from the screenshot by the navigator', items.join('\n'));
+        const added = collection.length - before;
+        postExecutionEvent(
+          port,
+          Actors.SYSTEM,
+          'step.ok',
+          taskId,
+          `Step ${stepsUsed}: ${description} ✓ — ${added} new, ${collection.length} total`,
+          '⚙ recorded',
+        );
+        lastAction = null;
+        await persist('running');
+        continue;
+      }
 
       if (step.textFrom === 'collected') await curateBeforeWrite();
 

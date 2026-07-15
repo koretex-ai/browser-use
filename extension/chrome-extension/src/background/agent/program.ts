@@ -139,6 +139,8 @@ export function describeStep(step: ProgramStep): string {
       return `extract "${step.query}"`;
     case 'harvest':
       return `harvest "${step.query}" until ${step.until ?? 10} items`;
+    case 'collect':
+      return `record ${step.items?.length ?? 0} item(s) read from the screenshot`;
     case 'verify_visual':
       return `verify visually: "${step.question}"`;
     case 'wait':

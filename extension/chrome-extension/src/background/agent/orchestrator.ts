@@ -84,6 +84,8 @@ export interface ProgramStep {
   question?: string;
   /** harvest: stop once ~this many items are collected */
   until?: number;
+  /** collect (stepwise only): items the navigator read off the SCREENSHOT */
+  items?: string[];
   maxScrolls?: number;
   direction?: 'up' | 'down';
   times?: number;
@@ -181,7 +183,8 @@ const NEXT_STEP_FORMS = `Step forms (the runtime executes these EXACTLY — put 
 {"do":"key","combo":"Enter"}  (submit a search box after typing into it)
 {"do":"scroll","direction":"down","times":2}
 {"do":"extract","query":"<what to read from the page text>"}  (a local reader answers from the FULL page text; list items are stored in the collection — also the way to read more than the truncated text sample shows)
-{"do":"harvest","query":"<items to collect>","until":10}  (scroll+extract loop until ~N unique items are collected or results stop yielding — USE THIS for any collect-N-things-from-a-feed work; the runtime deduplicates; 0 items fails the step)
+{"do":"harvest","query":"<items to collect>","until":10}  (scroll+extract loop until ~N unique items are collected or results stop yielding — for LARGE collections; the runtime deduplicates; 0 items fails the step)
+{"do":"collect","items":["<one item per entry>", ...]}  (record data YOU can read on the SCREENSHOT into the collection — the RELIABLE way to capture what you can see: posts, names, rows. Write each item complete and already formatted for its destination. Text extraction is garbled on some sites; your own eyes are not. Use extract/harvest only for content beyond the visible screenshot or for large lists.)
 {"do":"wait","ms":2000}  (the page is visibly still loading — look again after a pause)
 Targets are element DESCRIPTIONS (visible text labels), resolved on the live page by label matching with a vision fallback — never invent element indices.
 
@@ -189,7 +192,7 @@ SIDE EFFECTS — a step that posts, sends, submits a form, purchases, or deletes
 
 WRITING COLLECTED DATA: a type/type_focused step may use "textFrom":"collected" — the runtime inserts EVERY item collected so far, complete and verbatim, below the optional "text" (which becomes a header line). This is the ONLY reliable way to write a collected dataset — journal digests are truncated, so never paste them into "text" yourself. Have harvest/extract queries request each item ALREADY IN THE FORM it should appear at the destination (tab-separated only where tabs are meaningful, e.g. a spreadsheet grid).
 
-Canvas-rendered editors (e.g. Google Docs/Sheets) render input literally, not as markup — type into them with type_focused (they focus themselves when opened; clicking around first can steal focus).`;
+Canvas-rendered editors (e.g. Google Docs/Sheets) render input literally, not as markup — type into them with type_focused (they focus themselves when opened; clicking around first can steal focus). type_focused INSERTS at the focus — it does NOT clear existing content; if a failed earlier attempt left partial content behind, restore a clean state first (in a text editor: select-all then retype; in a grid: select the cells and delete). GOOGLE SHEETS specifically: typing goes into the SELECTED CELL; Tab moves one column right, Enter commits and moves one row down — so select the starting cell (A1 for a fresh sheet), then type_focused rows as tab-separated columns with one row per line. Never press select-all in a spreadsheet grid (it selects every cell, not text).`;
 
 const NEXT_SYSTEM_PROMPT = `You are the navigator for a browser agent. You work ONE step at a time: a deterministic runtime executes each step you decide against the user's active tab, then returns to you with a fresh SCREENSHOT of the tab, a page digest, and the journal. Local models handle perception details (locating elements to click, bulk-reading page text); you make every decision.
 
@@ -343,6 +346,7 @@ export async function nextStep(
     'scroll',
     'extract',
     'harvest',
+    'collect',
     'wait',
     'wait_for',
   ]);
