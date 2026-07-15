@@ -466,10 +466,18 @@ export async function runStepwiseTask(
         if (signal.aborted) throw error;
         const message = error instanceof Error ? error.message : String(error);
         logger.warning('nextStep call failed:', message);
-        await report('partial', `Navigator call failed: ${message.slice(0, 200)}`);
-        outcome = 'fail';
-        outcomeSummary = 'navigator call failed';
-        return;
+        // A misfired call is not a reasoned cause of death — retake the turn
+        // (fresh observe + decide), bounded by the same rejection cap
+        rejections++;
+        note(`navigator call failed (${message.slice(0, 120)}) — retaking the turn`);
+        if (rejections >= MAX_REJECTIONS) {
+          await report('partial', `Navigator calls kept failing: ${message.slice(0, 200)}`);
+          outcome = 'fail';
+          outcomeSummary = 'navigator call failures';
+          return;
+        }
+        heartbeat('That decision call failed — retaking the turn…');
+        continue;
       }
       const decideMeta = track(call.usage);
       const decision = call.result;

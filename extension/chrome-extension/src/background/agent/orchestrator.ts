@@ -330,6 +330,30 @@ export async function nextStep(
       ? ''
       : '\n\n(NOTE: no screenshot is available this turn — judge from the digest and page-text sample, and be conservative: prefer "uncertain" over guessing.)') +
     journalSection(args.journal);
+  // Models sometimes put the step's ACTION TYPE in the decision field
+  // ({"decision":"extract","query":...}) — the intent is unambiguous, so
+  // reshape it instead of dying on it (live failure 2026-07-15: one such
+  // reply killed an otherwise-healthy run)
+  const STEP_DOS = new Set([
+    'navigate',
+    'click',
+    'type',
+    'type_focused',
+    'key',
+    'scroll',
+    'extract',
+    'harvest',
+    'wait',
+    'wait_for',
+  ]);
+  const coerce = (value: NextResult): NextResult => {
+    const raw = value as NextResult & Record<string, unknown>;
+    if (STEP_DOS.has(String(raw.decision))) {
+      const step = (raw.step as ProgramStep | undefined) ?? ({ ...raw, do: raw.decision } as unknown as ProgramStep);
+      return { ...value, decision: 'step', step };
+    }
+    return value;
+  };
   const validate = (value: NextResult): NextResult => {
     if (!['step', 'done', 'stop', 'clarify', 'chat'].includes(value.decision)) {
       throw new Error(`Navigator returned invalid decision: ${String(value.decision)}`);
@@ -349,7 +373,24 @@ export async function nextStep(
         lowLatency: true,
       },
     );
-    return { result: validate(value), usage };
+    const coerced = coerce(value);
+    if (['step', 'done', 'stop', 'clarify', 'chat'].includes(coerced.decision)) return { result: coerced, usage };
+    // Valid JSON, invalid schema — one corrective re-ask (the malformed-JSON
+    // sibling case already gets a retry inside callOrchestrator)
+    onProgress?.('The reply used an invalid decision — asking the navigator to correct it…');
+    const retry = await callOrchestrator<NextResult>(
+      NEXT_SYSTEM_PROMPT,
+      buildContent(Boolean(args.screenshotDataUrl)) +
+        `\n\n(Your previous reply had "decision":"${String(value.decision)}", which is INVALID. "decision" must be one of step|done|stop|clarify|chat — an action belongs INSIDE "step", e.g. {"decision":"step","step":{"do":"extract",...}}. Reply again, corrected.)`,
+      signal,
+      onProgress,
+      {
+        imageDataUrl: args.screenshotDataUrl,
+        modelOverride: navigatorModel || undefined,
+        lowLatency: true,
+      },
+    );
+    return { result: validate(coerce(retry.value)), usage: retry.usage };
   } catch (error) {
     // Degraded fallback: if the call keeps dying WITH the screenshot attached
     // (transient network / provider stall — observed twice on media-heavy
@@ -365,7 +406,7 @@ export async function nextStep(
       onProgress,
       { modelOverride: navigatorModel || undefined, lowLatency: true },
     );
-    return { result: validate(value), usage };
+    return { result: validate(coerce(value)), usage };
   }
 }
 
