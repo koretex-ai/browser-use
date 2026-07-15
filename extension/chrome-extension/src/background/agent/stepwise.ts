@@ -7,6 +7,7 @@ import { streamCloudChatReply } from './chat';
 import { nextStep, reportOutcome, curateCollection } from './orchestrator';
 import type { ProgramStep, CallUsage, StepExpect } from './orchestrator';
 import { createStepRunner, describeStep, listLines, itemKey } from './program';
+import { verifyVisual } from './grounder';
 import {
   verifyExpect,
   describeExpect,
@@ -157,6 +158,14 @@ export async function runStepwiseTask(
 
   const scout = async (): Promise<string | undefined> => {
     const state = await capturePageState(tabId, false).catch(() => null);
+    if (state) {
+      try {
+        const url = new URL(state.url);
+        currentUrlPath = url.host + url.pathname;
+      } catch {
+        currentUrlPath = state.url.slice(0, 120);
+      }
+    }
     return state ? `${state.title} — ${state.url}\nELEMENTS:\n${elementsDigestOf(state).join('\n')}` : undefined;
   };
 
@@ -287,11 +296,19 @@ export async function runStepwiseTask(
     signal,
   );
 
-  // In-code memory for the safety guards
+  // In-code memory for the safety guards. PERMANENT for the run — an
+  // intervening successful step must never launder a failed action back into
+  // eligibility (live bug 2026-07-15: click "Post" failed verification, an
+  // unrelated click passed and wiped the memory, and the navigator re-issued
+  // the possibly-landed post).
   const typedSoFar: string[] = [];
-  let lastFailedFingerprint: string | null = null;
-  let lastFailedWasSideEffect = false;
-  let repeatWarnings = 0;
+  const failedCounts = new Map<string, number>();
+  // Side-effect failures are remembered WITH the page they happened on:
+  // re-issuing the same action on the same surface is blocked outright, while
+  // a genuinely different surface (e.g. a dedicated compose dialog after an
+  // inline-composer attempt) stays possible.
+  const failedSideEffectContexts = new Set<string>();
+  let currentUrlPath = '';
   let consecutiveFailures = 0;
   let decidedAny = false;
   let outcome: 'ok' | 'fail' | null = null;
@@ -432,10 +449,10 @@ export async function runStepwiseTask(
       }
 
       const fingerprint = actionFingerprint(step);
-      if (step.sideEffect && lastFailedWasSideEffect && fingerprint === lastFailedFingerprint) {
+      if (step.sideEffect && failedSideEffectContexts.has(`${fingerprint}@${currentUrlPath}`)) {
         rejections++;
         note(
-          'step rejected: that side-effect action already failed VERIFICATION and may have taken effect — verify its outcome (navigate to where the result would be visible) instead of re-issuing it.',
+          'step rejected: that side-effect action already failed VERIFICATION on this same page and may have taken effect — verify its outcome (navigate to where the result would be visible and check) instead of re-issuing it.',
         );
         if (rejections >= MAX_REJECTIONS) {
           await report('partial', 'A side-effect step failed verification and must not be blindly repeated.');
@@ -445,15 +462,17 @@ export async function runStepwiseTask(
         }
         continue;
       }
-      if (fingerprint === lastFailedFingerprint) {
-        repeatWarnings++;
-        if (repeatWarnings >= 2) {
-          await report('partial', 'The navigator kept deciding the same failing step.');
-          outcome = 'fail';
-          outcomeSummary = 'repeat-decision loop';
-          return;
-        }
-        note('warning: this exact action just failed — if it fails again the run stops; the NEXT decision must take a different approach.');
+      const priorFailures = failedCounts.get(fingerprint) ?? 0;
+      if (priorFailures >= 2) {
+        await report('partial', 'The navigator kept deciding the same failing step.');
+        outcome = 'fail';
+        outcomeSummary = 'repeat-decision loop';
+        return;
+      }
+      if (priorFailures === 1) {
+        note(
+          'warning: this exact action already failed once this run — if it fails again the run stops; prefer a different approach.',
+        );
       }
 
       stepsUsed++;
@@ -500,6 +519,27 @@ export async function runStepwiseTask(
         if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, 1200));
       }
 
+      // SIDE-EFFECT CROSS-EXAMINATION: for irreversible actions the risk is
+      // asymmetric — a false FAIL invites a duplicate side effect, which is
+      // strictly worse than a false pass. Before recording a side-effect
+      // verification failure, get a second opinion from vision: the
+      // deterministic expect may simply be wrong for this surface (live case
+      // 2026-07-15: the post landed, but the expect assumed the INLINE
+      // composer would be "gone" — inline composers clear, they never close).
+      let visionConfirmed = false;
+      if (!passed && !inconclusive && step.sideEffect) {
+        const question = `The browser just performed this action: ${describeStep(step)}${decision.why ? ` (purpose: ${decision.why.slice(0, 100)})` : ''}. Looking at the page as it is now, did that action succeed?`;
+        const answer = await verifyVisual(tabId, question, signal).catch(error => {
+          logger.warning('side-effect vision cross-exam failed:', error);
+          return '';
+        });
+        if (/^\s*yes\b/i.test(answer.trim())) {
+          passed = true;
+          visionConfirmed = true;
+          observation = `the deterministic check failed (${observation.slice(0, 100)}) but vision confirms the action succeeded: ${answer.slice(0, 120)}`;
+        }
+      }
+
       if (!passed && inconclusive) {
         postExecutionEvent(
           port,
@@ -513,8 +553,6 @@ export async function runStepwiseTask(
           `step ${stepsUsed} could NOT be verified (perception failed, not a step failure) — proceeding: ${describeStep(step)}`,
         );
         consecutiveFailures = 0;
-        lastFailedFingerprint = null;
-        lastFailedWasSideEffect = false;
         await persist('running');
         continue;
       }
@@ -525,16 +563,13 @@ export async function runStepwiseTask(
           Actors.SYSTEM,
           'step.ok',
           taskId,
-          `${stepLabel} ✓${hasExpectation(step.expect) ? ` (${describeExpect(step.expect!)})` : ''}`,
-          '⚙ verified · $0',
+          `${stepLabel} ✓${visionConfirmed ? ' (vision confirmed the outcome; the deterministic check was wrong for this surface)' : hasExpectation(step.expect) ? ` (${describeExpect(step.expect!)})` : ''}`,
+          visionConfirmed ? '⚙ vision-verified' : '⚙ verified · $0',
         );
         note(
           `step ${stepsUsed} ok: ${describeStep(step)}${observation && observation !== 'expect met' ? ` — ${observation.slice(0, 120)}` : ''}`,
         );
         consecutiveFailures = 0;
-        repeatWarnings = 0;
-        lastFailedFingerprint = null;
-        lastFailedWasSideEffect = false;
         await persist('running');
         continue;
       }
@@ -551,8 +586,8 @@ export async function runStepwiseTask(
       );
       note(`step ${stepsUsed} FAILED: ${describeStep(step)} — ${observation.slice(0, 180)}`);
       consecutiveFailures++;
-      lastFailedFingerprint = fingerprint;
-      lastFailedWasSideEffect = Boolean(step.sideEffect);
+      failedCounts.set(fingerprint, (failedCounts.get(fingerprint) ?? 0) + 1);
+      if (step.sideEffect) failedSideEffectContexts.add(`${fingerprint}@${currentUrlPath}`);
       await persist('running');
 
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
