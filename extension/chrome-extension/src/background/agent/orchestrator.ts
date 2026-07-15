@@ -193,7 +193,7 @@ Canvas-rendered editors (e.g. Google Docs/Sheets) render input literally, not as
 
 const NEXT_SYSTEM_PROMPT = `You are the navigator for a browser agent. You work ONE step at a time: a deterministic runtime executes each step you decide against the user's active tab, then returns to you with a fresh SCREENSHOT of the tab, a page digest, and the journal. Local models handle perception details (locating elements to click, bulk-reading page text); you make every decision.
 
-You are given: the OBJECTIVE, STEPS USED n of N, LAST ACTION (the step just executed and what the executor reported), CURRENT PAGE (url, title, visible element labels, truncated page-text sample), the JOURNAL (chronological history: every step, your judgment of it, and data collected), and the SCREENSHOT of the tab as it looks right now.
+You are given: the OBJECTIVE, STEPS USED plus TIME REMAINING, LAST ACTION (the step just executed and what the executor reported), CURRENT PAGE (url, title, visible element labels, truncated page-text sample), the JOURNAL (chronological history: every step, your judgment of it, and data collected), and the SCREENSHOT of the tab as it looks right now.
 
 YOUR FIRST JOB EVERY TURN IS TO JUDGE. Look at the screenshot and state what you actually see and what the LAST ACTION accomplished — as evidence, not hope: "the composer is open and empty", "the post now appears at the top of the feed", "a dialog is asking to confirm deletion", "the page is still loading". Then rule the last action succeeded, failed, or uncertain. Judge ONLY from visible evidence; wanting it to have worked is not evidence. If the page looks mid-load (spinners, blank regions), say so and prefer a short {"do":"wait"} over guessing.
 
@@ -218,7 +218,7 @@ Decision rules:
 - A step that redoes work a failed attempt may have PARTIALLY completed must first restore a clean state (select-all/clear before retyping; close a half-open dialog).
 - TO CONFIRM whether content exists beyond the visible screenshot (a saved row, an older post), use extract — absence from the digest or a scrolled-away screenshot is not evidence of absence.
 - Never plan logging in or handling credentials — if a login wall appears, stop.
-- You are told STEPS USED n of N: when nearing the budget, deliver the objective with the data already collected — a delivered partial beats an undelivered perfect.`;
+- You are told TIME REMAINING: there is no step limit, but when only a few minutes remain, stop exploring and DELIVER the objective with the data already collected — a delivered partial beats an undelivered perfect. Deliverables that need a destination (a sheet, a doc) take several steps; budget for them.`;
 
 export interface NextResult {
   assessment?: string;
@@ -238,6 +238,8 @@ export interface NextArgs {
   lastAction?: { description: string; execNote: string } | null;
   stepsUsed: number;
   maxSteps: number;
+  /** Minutes left on the wall-clock budget — the budget the navigator plans against */
+  timeRemainingMin?: number;
   /** Screenshot of the tab as it looks now (data URL); omit if capture failed */
   screenshotDataUrl?: string;
 }
@@ -252,8 +254,12 @@ export async function nextStep(
     ? `\n\nLAST ACTION (just executed — judge its outcome from the screenshot):\n${args.lastAction.description}\nExecutor reported: ${args.lastAction.execNote || '(nothing)'}`
     : '\n\nLAST ACTION: none — this is the first turn; judge only what the current page shows.';
   const pageSection = args.pageDigest ? `\n\nCURRENT PAGE (the active tab right now):\n${args.pageDigest}` : '';
+  const budgetLine =
+    args.timeRemainingMin !== undefined
+      ? `\n\nSTEPS USED: ${args.stepsUsed} · TIME REMAINING: about ${args.timeRemainingMin} minute(s)`
+      : `\n\nSTEPS USED: ${args.stepsUsed} of ${args.maxSteps}`;
   const buildContent = (withScreenshot: boolean) =>
-    `OBJECTIVE: ${args.objective}\n\nSTEPS USED: ${args.stepsUsed} of ${args.maxSteps}` +
+    `OBJECTIVE: ${args.objective}${budgetLine}` +
     lastSection +
     pageSection +
     (withScreenshot

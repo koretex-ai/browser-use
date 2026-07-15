@@ -34,7 +34,10 @@ const logger = createLogger('stepwise');
  * for verification robustness. The no-API-key local path is unaffected.
  */
 
-const MAX_STEPS = 30;
+// NOT a working budget — a runaway backstop only (user decision 2026-07-15:
+// steps are cheap and fast now; the wall clock is the real budget). A run
+// that legitimately needs many steps must never be guillotined mid-progress.
+const MAX_STEPS = 150;
 const MAX_TASK_MS = 15 * 60_000;
 const JOURNAL_MAX_LINES = 80;
 const MAX_CONSECUTIVE_FAILURES = 4;
@@ -362,6 +365,7 @@ export async function runStepwiseTask(
               : null,
             stepsUsed,
             maxSteps: MAX_STEPS,
+            timeRemainingMin: Math.max(0, Math.round((deadline - Date.now()) / 60_000)),
             screenshotDataUrl: observed.screenshot,
           },
           signal,
