@@ -405,9 +405,15 @@ async function callOrchestrator<T>(
       // SCREENSHOTS of the user's logged-in browser — route only to
       // providers that neither train on nor retain prompts (OpenRouter
       // provider preference).
-      // sort:"price" — throughput-sorting routed every call to the MOST
-      // expensive MiMo host (DeepInfra, $2/M out vs $0.28 elsewhere)
-      provider: { data_collection: 'deny', ...(opts?.lowLatency ? { sort: 'price' } : {}) },
+      // Fastest host UNDER a price ceiling: sort:"throughput" alone routed to
+      // the priciest host ($2/M out, DeepInfra); sort:"price" alone routed to
+      // a 12-24 tok/s host (DigitalOcean) whose slow generation WAS the
+      // timeouts. max_price ($/M) keeps the $0.14/$0.28-class hosts in play
+      // and excludes the expensive tier; throughput picks the fastest of them.
+      provider: {
+        data_collection: 'deny',
+        ...(opts?.lowLatency ? { sort: 'throughput', max_price: { prompt: 0.25, completion: 0.6 } } : {}),
+      },
       // Navigator turns need a look and a JSON verdict, not an essay. Live
       // failure 2026-07-15: runaway chain-of-thought hit the default 16,384
       // output cap ("length") on ~1/3 of turns — 58s + $0.033 each, and the

@@ -573,6 +573,14 @@ export async function runStepwiseTask(
         continue;
       }
 
+      // Journal the EXECUTION immediately — if the run dies before the next
+      // turn's judgment, the report must still know this action ran (live
+      // failure: a report claimed "NOT posted" about an executed Post click
+      // whose judgment turn never happened; the post was live)
+      note(
+        `step ${stepsUsed} EXECUTED${step.sideEffect ? ' [side-effect]' : ''}: ${describeStep(step)} — outcome not yet judged${step.sideEffect ? '; it may have taken effect' : ''}`,
+      );
+
       // Executed — give the page time to react before the next observation
       await sleep(SETTLE_MS[step.do] ?? 400);
       lastAction = {
