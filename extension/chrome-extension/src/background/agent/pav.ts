@@ -44,6 +44,11 @@ const RESUME_WINDOW_MS = 30 * 60_000;
 // steps may omit one
 const STATE_CHANGING = new Set(['navigate', 'click', 'type', 'type_focused', 'key']);
 
+function fmtDuration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return s < 100 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+}
+
 function cloudMeta(usage: CallUsage): string {
   const cost =
     usage.cost !== null
@@ -51,7 +56,9 @@ function cloudMeta(usage: CallUsage): string {
       : usage.promptTokens !== null
         ? `${usage.promptTokens}+${usage.completionTokens ?? 0} tok`
         : 'cost n/a';
-  return `☁ ${usage.model} · ${cost}`;
+  const calls = (usage.calls ?? 1) > 1 ? ` · ${usage.calls} model calls` : '';
+  const took = usage.durationMs !== undefined ? ` · ${fmtDuration(usage.durationMs)}` : '';
+  return `☁ ${usage.model} · ${cost}${calls}${took}`;
 }
 
 function elementsDigestOf(state: PerceptionSnapshot | null): string[] {
@@ -129,12 +136,16 @@ export async function runPavTask(
   const startedAt = Date.now();
   let costKnown = true;
   const track = (usage: CallUsage): string => {
-    record.cloudCalls++;
+    record.cloudCalls += usage.calls ?? 1;
     record.orchestratorModel = usage.model;
     if (usage.cost !== null) record.totalCostUsd += usage.cost;
     else costKnown = false;
     return cloudMeta(usage);
   };
+  // Heartbeat: a visible one-liner whenever the conductor is about to wait on
+  // something slow (a cloud call can take minutes) — several silent minutes
+  // behind a bare progress bar is indistinguishable from a hang.
+  const heartbeat = (message: string) => postExecutionEvent(port, Actors.SYSTEM, 'step.ok', taskId, message);
   const totalMeta = () =>
     `task total ${costKnown ? '' : '≥'}$${record.totalCostUsd.toFixed(4)} · ${record.cloudCalls} cloud call${record.cloudCalls === 1 ? '' : 's'}`;
 
@@ -218,8 +229,9 @@ export async function runPavTask(
   const report = async (status: 'achieved' | 'partial', reason: string): Promise<void> => {
     let meta = '';
     let answer: string;
+    heartbeat(status === 'achieved' ? 'Objective met — writing the final answer…' : 'Writing up what happened…');
     try {
-      const result = await reportOutcome(goalText, status, journal, collection, signal);
+      const result = await reportOutcome(goalText, status, journal, collection, signal, heartbeat);
       answer = result.answer;
       meta = track(result.usage);
     } catch (error) {
@@ -251,7 +263,8 @@ export async function runPavTask(
   const curateBeforeWrite = async (meta: string): Promise<string> => {
     if (curated || collection.length === 0) return meta;
     curated = true;
-    const result = await curateCollection(goalText, collection.slice(), signal);
+    heartbeat(`Reviewing the ${collection.length} collected item(s) against the objective…`);
+    const result = await curateCollection(goalText, collection.slice(), signal, heartbeat);
     const usedMeta = result.usage ? track(result.usage) : meta;
     if (result.items.length && result.items.length !== collection.length) {
       collection.length = 0;
@@ -330,14 +343,27 @@ export async function runPavTask(
       }
 
       // ---- PLAN ----
+      heartbeat(
+        plansUsed === 0
+          ? 'Reading the page and drafting a plan… (a big plan can take a minute or two)'
+          : `Replanning (attempt ${plansUsed + 1}/${MAX_PLANS})…`,
+      );
       const pageDigest = await scout();
       let planCall;
       try {
-        planCall = await planTask(goalText, journal, pageDigest, plansUsed, MAX_PLANS, signal, plan =>
-          collectExpectFaults(
-            (plan.steps ?? []).slice(0, MAX_STEPS_PER_PLAN),
-            (plan.objective ?? []).filter(hasExpectation).slice(0, 4),
-          ),
+        planCall = await planTask(
+          goalText,
+          journal,
+          pageDigest,
+          plansUsed,
+          MAX_PLANS,
+          signal,
+          plan =>
+            collectExpectFaults(
+              (plan.steps ?? []).slice(0, MAX_STEPS_PER_PLAN),
+              (plan.objective ?? []).filter(hasExpectation).slice(0, 4),
+            ),
+          heartbeat,
         );
       } catch (error) {
         if (signal.aborted) throw error;
@@ -572,6 +598,7 @@ export async function runPavTask(
         }
 
         let reflectCall;
+        heartbeat('Diagnosing the failed step…');
         try {
           reflectCall = await reflectOnFailure(
             goalText,
@@ -581,6 +608,7 @@ export async function runPavTask(
             step,
             observation,
             signal,
+            heartbeat,
           );
         } catch (error) {
           if (signal.aborted) throw error;

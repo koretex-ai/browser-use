@@ -399,7 +399,20 @@ export function createStepRunner(
       }
       case 'extract': {
         if (!step.query) return { ok: false, message: 'extract step has no query' };
-        const { note } = await runExtract(step.query);
+        const { newItems, note } = await runExtract(step.query);
+        // Zero-yield parity with harvest: a read that found NOTHING while the
+        // task collection is still empty is a step failure the reflector must
+        // see NOW — not a silent ✓ that surfaces as an empty deliverable ten
+        // steps later. A dry read on top of an existing collection stays ok
+        // (the tail of a scroll+extract sequence legitimately runs dry), and a
+        // prose answer (a fact, not list items) counts as content.
+        const foundNothing = newItems === 0 && (/^(NOT FOUND|nothing new|no new items)/i.test(note) || !note.trim());
+        if (foundNothing && (ctx.collectedItems?.() ?? []).length === 0) {
+          return {
+            ok: false,
+            message: `extract collected 0 items — the content may not have rendered yet or the query matched nothing on this page (reader said: ${note || 'empty answer'})`,
+          };
+        }
         return { ok: true, message: note };
       }
       case 'verify_visual': {

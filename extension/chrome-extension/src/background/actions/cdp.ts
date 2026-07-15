@@ -1,6 +1,13 @@
 import { createLogger } from '../log';
+import { withTimeout } from '../net';
 
 const logger = createLogger('cdp');
+
+// A wedged tab can hang chrome.debugger calls indefinitely; nothing the
+// conductor awaits may hang (net.ts principle) — a stall must surface as a
+// labeled error, not a silent forever-spinner
+const CDP_ATTACH_TIMEOUT_MS = 10_000;
+const CDP_COMMAND_TIMEOUT_MS = 15_000;
 
 /**
  * CDP escape hatch (DESIGN.md Phase 6): trusted input via chrome.debugger.
@@ -25,7 +32,7 @@ const attached = new Set<number>();
 async function ensureAttached(tabId: number): Promise<void> {
   if (attached.has(tabId)) return;
   try {
-    await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
+    await withTimeout(chrome.debugger.attach({ tabId }, PROTOCOL_VERSION), CDP_ATTACH_TIMEOUT_MS, 'debugger attach');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/already attached/i.test(message)) {
@@ -54,7 +61,7 @@ chrome.debugger.onDetach.addListener(source => {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function send(tabId: number, method: string, params?: Record<string, any>): Promise<void> {
   await ensureAttached(tabId);
-  await chrome.debugger.sendCommand({ tabId }, method, params);
+  await withTimeout(chrome.debugger.sendCommand({ tabId }, method, params), CDP_COMMAND_TIMEOUT_MS, `CDP ${method}`);
 }
 
 interface KeySpec {

@@ -208,12 +208,20 @@ export interface CallUsage {
   cost: number | null;
   promptTokens: number | null;
   completionTokens: number | null;
+  /** HTTP requests behind this logical call (JSON retries + repair rounds) */
+  calls?: number;
+  /** Wall-clock time spent waiting on the model, summed across those requests */
+  durationMs?: number;
 }
+
+/** Called when a logical call needs extra rounds, so the UI can say why it is slow */
+export type ProgressFn = (message: string) => void;
 
 async function callOrchestrator<T>(
   systemPrompt: string,
   userContent: string,
   signal: AbortSignal,
+  onProgress?: ProgressFn,
 ): Promise<{ value: T; usage: CallUsage }> {
   const { orchestratorBaseUrl, orchestratorApiKey, orchestratorModel } = await chatSettingsStore.getSettings();
   const model = orchestratorModel;
@@ -221,6 +229,7 @@ async function callOrchestrator<T>(
   const request = async (
     messages: { role: string; content: string }[],
   ): Promise<{ content: string; usage: CallUsage }> => {
+    const requestStartedAt = Date.now();
     const response = await fetchWithTimeout(
       `${orchestratorBaseUrl.replace(/\/$/, '')}/chat/completions`,
       {
@@ -248,7 +257,8 @@ async function callOrchestrator<T>(
     const data = await response.json();
     if (data.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
     const content: string = data.choices?.[0]?.message?.content ?? '';
-    logger.info('orchestrator response:', content.slice(0, 300));
+    const durationMs = Date.now() - requestStartedAt;
+    logger.info(`orchestrator response (${Math.round(durationMs / 1000)}s):`, content.slice(0, 300));
     return {
       content,
       usage: {
@@ -256,6 +266,8 @@ async function callOrchestrator<T>(
         cost: typeof data.usage?.cost === 'number' ? data.usage.cost : null,
         promptTokens: data.usage?.prompt_tokens ?? null,
         completionTokens: data.usage?.completion_tokens ?? null,
+        calls: 1,
+        durationMs,
       },
     };
   };
@@ -270,6 +282,7 @@ async function callOrchestrator<T>(
   } catch (parseError) {
     // One malformed reply is worth a retry, not a dead task
     logger.warning('orchestrator returned non-JSON, retrying once:', parseError);
+    onProgress?.('The model reply was malformed — asking it once more…');
     const retry = await request([
       ...messages,
       { role: 'assistant', content: first.content.slice(0, 2000) },
@@ -279,16 +292,22 @@ async function callOrchestrator<T>(
           'That was not valid JSON. Reply ONLY with the JSON object in the specified format — no prose, no code fences.',
       },
     ]);
-    const sum = (a: number | null, b: number | null): number | null =>
-      a === null && b === null ? null : (a ?? 0) + (b ?? 0);
-    const usage: CallUsage = {
-      model: retry.usage.model,
-      cost: sum(first.usage.cost, retry.usage.cost),
-      promptTokens: sum(first.usage.promptTokens, retry.usage.promptTokens),
-      completionTokens: sum(first.usage.completionTokens, retry.usage.completionTokens),
-    };
-    return { value: parseJsonObject<T>(retry.content), usage };
+    return { value: parseJsonObject<T>(retry.content), usage: combineUsage(first.usage, retry.usage) };
   }
+}
+
+/** Sum two usages into one logical-call attribution (retries, repair rounds) */
+function combineUsage(a: CallUsage, b: CallUsage | null | undefined): CallUsage {
+  if (!b) return a;
+  const sum = (x: number | null, y: number | null): number | null => (x === null && y === null ? null : (x ?? 0) + (y ?? 0));
+  return {
+    model: b.model ?? a.model,
+    cost: sum(a.cost, b.cost),
+    promptTokens: sum(a.promptTokens, b.promptTokens),
+    completionTokens: sum(a.completionTokens, b.completionTokens),
+    calls: (a.calls ?? 1) + (b.calls ?? 1),
+    durationMs: (a.durationMs ?? 0) + (b.durationMs ?? 0),
+  };
 }
 
 function journalSection(journal: string[]): string {
@@ -310,11 +329,12 @@ export async function planTask(
    * rejected" opener and burned a plan slot every run).
    */
   validate?: (plan: PlanResult) => string[],
+  onProgress?: ProgressFn,
 ): Promise<{ result: PlanResult; usage: CallUsage }> {
   const pageSection = pageDigest ? `\n\nCURRENT PAGE (the active tab right now):\n${pageDigest}` : '';
   const baseContent =
     `OBJECTIVE: ${objective}\n\nPLANS USED: ${plansUsed} of ${maxPlans}` + pageSection + journalSection(journal);
-  const first = await callOrchestrator<PlanResult>(PLAN_SYSTEM_PROMPT, baseContent, signal);
+  const first = await callOrchestrator<PlanResult>(PLAN_SYSTEM_PROMPT, baseContent, signal, onProgress);
   if (!['chat', 'plan', 'clarify'].includes(first.value.mode)) {
     throw new Error(`Planner returned invalid mode: ${String(first.value.mode)}`);
   }
@@ -325,17 +345,15 @@ export async function planTask(
 
   // Inline repair round: give the model its own plan back plus the exact
   // faults, and ask it to fix ONLY those.
+  onProgress?.('The draft plan had invalid success checks — asking the planner to correct them…');
   const repairContent =
     `${baseContent}\n\nYou proposed this plan:\n${JSON.stringify({ steps: first.value.steps, objective: first.value.objective })}\n\n` +
     `It has these success-check (expect) faults:\n${faults.map(f => `- ${f}`).join('\n')}\n\n` +
     'Return the CORRECTED plan in the same JSON format. Fix ONLY these faults — keep everything else the same.';
-  const repaired = await callOrchestrator<PlanResult>(PLAN_SYSTEM_PROMPT, repairContent, signal).catch(() => null);
-  const combined: CallUsage = {
-    model: repaired?.usage.model ?? first.usage.model,
-    cost: first.usage.cost === null && !repaired ? null : (first.usage.cost ?? 0) + (repaired?.usage.cost ?? 0),
-    promptTokens: (first.usage.promptTokens ?? 0) + (repaired?.usage.promptTokens ?? 0),
-    completionTokens: (first.usage.completionTokens ?? 0) + (repaired?.usage.completionTokens ?? 0),
-  };
+  const repaired = await callOrchestrator<PlanResult>(PLAN_SYSTEM_PROMPT, repairContent, signal, onProgress).catch(
+    () => null,
+  );
+  const combined = combineUsage(first.usage, repaired?.usage);
   // Use the repair only if it is a valid plan shape; otherwise fall through to
   // the conductor's backstop with the original (it will reject/replan).
   if (repaired && ['chat', 'plan', 'clarify'].includes(repaired.value.mode)) {
@@ -352,6 +370,7 @@ export async function reflectOnFailure(
   failedStep: ProgramStep,
   observation: string,
   signal: AbortSignal,
+  onProgress?: ProgressFn,
 ): Promise<{ result: ReflectResult; usage: CallUsage }> {
   const userContent =
     `OBJECTIVE: ${objective}\n\n` +
@@ -359,7 +378,12 @@ export async function reflectOnFailure(
     `FAILED STEP (${failedStepIndex + 1} of ${planSteps.length}):\n${JSON.stringify(failedStep)}\n\n` +
     `OBSERVATION:\n${observation}` +
     journalSection(journal);
-  const { value: result, usage } = await callOrchestrator<ReflectResult>(REFLECT_SYSTEM_PROMPT, userContent, signal);
+  const { value: result, usage } = await callOrchestrator<ReflectResult>(
+    REFLECT_SYSTEM_PROMPT,
+    userContent,
+    signal,
+    onProgress,
+  );
   if (!['fix_step', 'replan', 'stop'].includes(result.verdict)) {
     throw new Error(`Reflector returned invalid verdict: ${String(result.verdict)}`);
   }
@@ -382,6 +406,7 @@ export async function curateCollection(
   objective: string,
   items: string[],
   signal: AbortSignal,
+  onProgress?: ProgressFn,
 ): Promise<{ items: string[]; dropped: number; usage: CallUsage | null }> {
   if (items.length === 0) return { items, dropped: 0, usage: null };
   try {
@@ -390,6 +415,7 @@ export async function curateCollection(
       CURATE_SYSTEM_PROMPT,
       userContent,
       signal,
+      onProgress,
     );
     if (!Array.isArray(value.items) || value.items.length === 0) return { items, dropped: 0, usage };
     return { items: value.items, dropped: Math.max(0, items.length - value.items.length), usage };
@@ -406,12 +432,18 @@ export async function reportOutcome(
   journal: string[],
   collection: string[],
   signal: AbortSignal,
+  onProgress?: ProgressFn,
 ): Promise<{ answer: string; usage: CallUsage }> {
   const collectionSection = collection.length
     ? `\n\nCOLLECTED ITEMS (complete, deduplicated):\n${collection.slice(0, 100).join('\n').slice(0, 8000)}`
     : '';
   const userContent = `OBJECTIVE: ${objective}\n\nSTATUS: ${status}` + journalSection(journal) + collectionSection;
-  const { value, usage } = await callOrchestrator<{ answer: string }>(REPORT_SYSTEM_PROMPT, userContent, signal);
+  const { value, usage } = await callOrchestrator<{ answer: string }>(
+    REPORT_SYSTEM_PROMPT,
+    userContent,
+    signal,
+    onProgress,
+  );
   if (!value.answer) throw new Error('Report returned no answer');
   return { answer: value.answer, usage };
 }
