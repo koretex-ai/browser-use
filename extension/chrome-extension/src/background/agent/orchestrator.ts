@@ -251,24 +251,51 @@ export async function nextStep(
     ? `\n\nLAST ACTION (just executed — judge its outcome from the screenshot):\n${args.lastAction.description}\nExecutor reported: ${args.lastAction.execNote || '(nothing)'}`
     : '\n\nLAST ACTION: none — this is the first turn; judge only what the current page shows.';
   const pageSection = args.pageDigest ? `\n\nCURRENT PAGE (the active tab right now):\n${args.pageDigest}` : '';
-  const shotSection = args.screenshotDataUrl
-    ? ''
-    : '\n\n(NOTE: the screenshot could not be captured this turn — judge from the digest and be conservative.)';
-  const content =
+  const buildContent = (withScreenshot: boolean) =>
     `OBJECTIVE: ${args.objective}\n\nSTEPS USED: ${args.stepsUsed} of ${args.maxSteps}` +
     lastSection +
     pageSection +
-    shotSection +
+    (withScreenshot
+      ? ''
+      : '\n\n(NOTE: no screenshot is available this turn — judge from the digest and page-text sample, and be conservative: prefer "uncertain" over guessing.)') +
     journalSection(args.journal);
-  const { value, usage } = await callOrchestrator<NextResult>(NEXT_SYSTEM_PROMPT, content, signal, onProgress, {
-    imageDataUrl: args.screenshotDataUrl,
-    modelOverride: navigatorModel || undefined,
-    lowLatency: true,
-  });
-  if (!['step', 'done', 'stop', 'clarify', 'chat'].includes(value.decision)) {
-    throw new Error(`Navigator returned invalid decision: ${String(value.decision)}`);
+  const validate = (value: NextResult): NextResult => {
+    if (!['step', 'done', 'stop', 'clarify', 'chat'].includes(value.decision)) {
+      throw new Error(`Navigator returned invalid decision: ${String(value.decision)}`);
+    }
+    return value;
+  };
+
+  try {
+    const { value, usage } = await callOrchestrator<NextResult>(
+      NEXT_SYSTEM_PROMPT,
+      buildContent(Boolean(args.screenshotDataUrl)),
+      signal,
+      onProgress,
+      {
+        imageDataUrl: args.screenshotDataUrl,
+        modelOverride: navigatorModel || undefined,
+        lowLatency: true,
+      },
+    );
+    return { result: validate(value), usage };
+  } catch (error) {
+    // Degraded fallback: if the call keeps dying WITH the screenshot attached
+    // (transient network / provider stall — observed twice on media-heavy
+    // post-submit pages), try once more image-free. A turn judged blind from
+    // the digest is strictly better than a dead run.
+    if (!args.screenshotDataUrl || signal.aborted || !isTransientNetworkError(error)) throw error;
+    logger.warning('navigator call failed with screenshot attached — retrying image-free:', error);
+    onProgress?.('The call kept failing with the screenshot attached — retrying without it…');
+    const { value, usage } = await callOrchestrator<NextResult>(
+      NEXT_SYSTEM_PROMPT,
+      buildContent(false),
+      signal,
+      onProgress,
+      { modelOverride: navigatorModel || undefined, lowLatency: true },
+    );
+    return { result: validate(value), usage };
   }
-  return { result: value, usage };
 }
 
 const REFLECT_SYSTEM_PROMPT = `You are the reflector for a browser agent. One step of the current plan failed verification (or failed to execute). You get the OBJECTIVE, the JOURNAL, the PLAN, the FAILED STEP with its expect, and the OBSERVATION — what the page or verifier actually shows. Observe carefully, work out what ACTUALLY happened and why the expectation was not met, and only then decide whether the STEP was wrong or the PLAN is wrong.
@@ -360,10 +387,29 @@ async function callOrchestrator<T>(
   const { orchestratorBaseUrl, orchestratorApiKey, orchestratorModel } = await chatSettingsStore.getSettings();
   const model = opts?.modelOverride || orchestratorModel;
 
+  // Per-step navigator turns must be snappy — a shorter window plus the
+  // image-free fallback beats waiting out two 90s stalls
+  const timeoutMs = opts?.lowLatency ? 60_000 : CLOUD_CALL_TIMEOUT_MS;
+
   const attemptRequest = async (
     messages: { role: string; content: MessageContent }[],
   ): Promise<{ content: string; usage: CallUsage }> => {
     const requestStartedAt = Date.now();
+    const body = JSON.stringify({
+      model,
+      messages,
+      temperature: 0.2,
+      usage: { include: true },
+      // Payloads can carry page digests and (for the stepwise navigator)
+      // SCREENSHOTS of the user's logged-in browser — route only to
+      // providers that neither train on nor retain prompts (OpenRouter
+      // provider preference).
+      provider: { data_collection: 'deny', ...(opts?.lowLatency ? { sort: 'throughput' } : {}) },
+      ...(opts?.lowLatency ? { reasoning: { effort: 'low' } } : {}),
+    });
+    // Payload size is the prime suspect when calls die on SPECIFIC turns
+    // (media-heavy pages → much larger screenshots) — make it visible
+    logger.info(`orchestrator request: ${Math.round(body.length / 1024)}KB body, model ${model}`);
     const response = await fetchWithTimeout(
       `${orchestratorBaseUrl.replace(/\/$/, '')}/chat/completions`,
       {
@@ -374,21 +420,10 @@ async function callOrchestrator<T>(
           'HTTP-Referer': 'https://github.com/koretex-ai/local-browser-use',
           'X-Title': 'Local Browser Use',
         },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature: 0.2,
-          usage: { include: true },
-          // Payloads can carry page digests and (for the stepwise navigator)
-          // SCREENSHOTS of the user's logged-in browser — route only to
-          // providers that neither train on nor retain prompts (OpenRouter
-          // provider preference).
-          provider: { data_collection: 'deny', ...(opts?.lowLatency ? { sort: 'throughput' } : {}) },
-          ...(opts?.lowLatency ? { reasoning: { effort: 'low' } } : {}),
-        }),
+        body,
       },
       signal,
-      CLOUD_CALL_TIMEOUT_MS,
+      timeoutMs,
     );
     if (!response.ok) {
       const detail = (await withTimeout(response.text(), 15_000, 'reading the error response').catch(() => '')).slice(
@@ -401,7 +436,7 @@ async function callOrchestrator<T>(
     // where the whole generation time lives — it must be bounded too (live
     // failure 2026-07-15: "90s-capped" navigator calls ran 2m35s because the
     // body read had no timeout)
-    const data = await withTimeout(response.json(), CLOUD_CALL_TIMEOUT_MS, 'reading the model response');
+    const data = await withTimeout(response.json(), timeoutMs, 'reading the model response');
     if (data.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
     const content: string = data.choices?.[0]?.message?.content ?? '';
     const durationMs = Date.now() - requestStartedAt;
