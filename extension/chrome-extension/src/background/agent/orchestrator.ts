@@ -1,6 +1,6 @@
 import { chatSettingsStore } from '@extension/storage';
 import { createLogger } from '../log';
-import { fetchWithTimeout } from '../net';
+import { fetchWithTimeout, withTimeout } from '../net';
 
 const logger = createLogger('orchestrator');
 
@@ -263,6 +263,7 @@ export async function nextStep(
   const { value, usage } = await callOrchestrator<NextResult>(NEXT_SYSTEM_PROMPT, content, signal, onProgress, {
     imageDataUrl: args.screenshotDataUrl,
     modelOverride: navigatorModel || undefined,
+    lowLatency: true,
   });
   if (!['step', 'done', 'stop', 'clarify', 'chat'].includes(value.decision)) {
     throw new Error(`Navigator returned invalid decision: ${String(value.decision)}`);
@@ -332,6 +333,21 @@ interface CallOpts {
   imageDataUrl?: string;
   /** Use this model instead of the configured orchestratorModel */
   modelOverride?: string;
+  /**
+   * Latency-sensitive call (the per-step navigator): prefer high-throughput
+   * providers and ask the model for minimal reasoning — a judge-and-decide
+   * turn needs a look and a verdict, not minutes of chain-of-thought.
+   */
+  lowLatency?: boolean;
+}
+
+// Network-transient errors (connection drop, provider blip, timeout) get one
+// retry — a run should not die because a single HTTP request hiccuped one
+// step from the finish line (live failure 2026-07-15: "Failed to fetch").
+function isTransientNetworkError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === 'AbortError') return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /failed to fetch|network|timed out|ECONNRESET|socket|HTTP 5\d\d|HTTP 429/i.test(message);
 }
 
 async function callOrchestrator<T>(
@@ -344,7 +360,7 @@ async function callOrchestrator<T>(
   const { orchestratorBaseUrl, orchestratorApiKey, orchestratorModel } = await chatSettingsStore.getSettings();
   const model = opts?.modelOverride || orchestratorModel;
 
-  const request = async (
+  const attemptRequest = async (
     messages: { role: string; content: MessageContent }[],
   ): Promise<{ content: string; usage: CallUsage }> => {
     const requestStartedAt = Date.now();
@@ -367,21 +383,32 @@ async function callOrchestrator<T>(
           // SCREENSHOTS of the user's logged-in browser — route only to
           // providers that neither train on nor retain prompts (OpenRouter
           // provider preference).
-          provider: { data_collection: 'deny' },
+          provider: { data_collection: 'deny', ...(opts?.lowLatency ? { sort: 'throughput' } : {}) },
+          ...(opts?.lowLatency ? { reasoning: { effort: 'low' } } : {}),
         }),
       },
       signal,
       CLOUD_CALL_TIMEOUT_MS,
     );
     if (!response.ok) {
-      const detail = (await response.text().catch(() => '')).slice(0, 200);
+      const detail = (await withTimeout(response.text(), 15_000, 'reading the error response').catch(() => '')).slice(
+        0,
+        200,
+      );
       throw new Error(`Orchestrator request failed (HTTP ${response.status}): ${detail}`);
     }
-    const data = await response.json();
+    // fetch resolves on HEADERS; for a non-streaming completion the BODY is
+    // where the whole generation time lives — it must be bounded too (live
+    // failure 2026-07-15: "90s-capped" navigator calls ran 2m35s because the
+    // body read had no timeout)
+    const data = await withTimeout(response.json(), CLOUD_CALL_TIMEOUT_MS, 'reading the model response');
     if (data.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
     const content: string = data.choices?.[0]?.message?.content ?? '';
     const durationMs = Date.now() - requestStartedAt;
-    logger.info(`orchestrator response (${Math.round(durationMs / 1000)}s):`, content.slice(0, 300));
+    logger.info(
+      `orchestrator response (${Math.round(durationMs / 1000)}s, ${data.usage?.completion_tokens ?? '?'} out tok):`,
+      content.slice(0, 300),
+    );
     return {
       content,
       usage: {
@@ -393,6 +420,22 @@ async function callOrchestrator<T>(
         durationMs,
       },
     };
+  };
+
+  // One transparent retry for transient network failures — never for user
+  // cancellation, and never a third attempt
+  const request = async (
+    messages: { role: string; content: MessageContent }[],
+  ): Promise<{ content: string; usage: CallUsage }> => {
+    try {
+      return await attemptRequest(messages);
+    } catch (error) {
+      if (signal.aborted || !isTransientNetworkError(error)) throw error;
+      logger.warning('transient network error, retrying once:', error);
+      onProgress?.('Network hiccup — retrying the model call…');
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      return attemptRequest(messages);
+    }
   };
 
   const userMessage: { role: string; content: MessageContent } = opts?.imageDataUrl

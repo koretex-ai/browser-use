@@ -346,6 +346,9 @@ export async function runStepwiseTask(
       }
 
       // ---- OBSERVE + JUDGE + DECIDE (one multimodal call) ----
+      if (decidedAny || lastAction) {
+        heartbeat('Looking at the result and deciding the next step…');
+      }
       const observed = await observe();
       let call;
       try {
@@ -388,7 +391,7 @@ export async function runStepwiseTask(
           'step.ok',
           taskId,
           `Step ${lastAction.stepNo} ${mark} — ${assessment || verdict}`,
-          '👁 judged',
+          '👁 judged (same call as the next decision — cost shown there)',
         );
         note(`judge on step ${lastAction.stepNo} (${lastAction.description.slice(0, 80)}): ${verdict} — ${assessment}`);
         if (verdict === 'failed') {
