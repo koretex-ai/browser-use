@@ -79,6 +79,12 @@ function actionFingerprint(step: ProgramStep): string {
   return JSON.stringify([step.do, step.url ?? '', step.target ?? '', step.query ?? '']);
 }
 
+// Actions whose target label suggests an irreversible submit. Generic verbs,
+// not site lore — the point is to force an EXPLICIT sideEffect declaration,
+// not to decide it: an unmarked submit would silently get the 2-attempt retry
+// and could fire twice.
+const SUBMITTY = /\b(post|send|submit|publish|delete|purchase|buy|pay|confirm|apply|tweet|reply)\b/i;
+
 // Runtime validity of ONE decided step (the stepwise counterpart of the plan
 // validator): state-changing steps need a real, non-degenerate expect, and a
 // side-effect step may not "prove" itself with text this run already typed.
@@ -91,6 +97,9 @@ function stepFaultReason(step: ProgramStep, typedSoFar: string[]): string | null
     if (step.sideEffect) {
       const weak = weakSideEffectExpectReason(step.expect!, typedSoFar);
       if (weak) return weak;
+    }
+    if ((step.do === 'click' || step.do === 'key') && step.sideEffect === undefined && SUBMITTY.test(step.target ?? '')) {
+      return `this ${step.do} on "${step.target}" may trigger an irreversible submit — declare "sideEffect" explicitly: true if it posts/sends/deletes/purchases, false if it merely opens a composer, menu, or dialog`;
     }
   }
   return null;
@@ -166,7 +175,17 @@ export async function runStepwiseTask(
         currentUrlPath = state.url.slice(0, 120);
       }
     }
-    return state ? `${state.title} — ${state.url}\nELEMENTS:\n${elementsDigestOf(state).join('\n')}` : undefined;
+    if (!state) return undefined;
+    // The navigator's page sense must include CONTENT, not just controls —
+    // element labels only cover interactive elements, so a decision like
+    // "check whether my post now appears" is impossible from labels alone
+    // (live failure 2026-07-15: navigated to the profile to confirm the post,
+    // could not see it, and fell back to re-posting)
+    const textSample = (state.pageText ?? '').replace(/\s+/g, ' ').trim().slice(0, 800);
+    return (
+      `${state.title} — ${state.url}\nELEMENTS:\n${elementsDigestOf(state).join('\n')}` +
+      (textSample ? `\nPAGE TEXT (truncated sample — use an extract step to read more):\n${textSample}` : '')
+    );
   };
 
   let goalText = task;
@@ -464,19 +483,30 @@ export async function runStepwiseTask(
       }
       const priorFailures = failedCounts.get(fingerprint) ?? 0;
       if (priorFailures >= 2) {
-        await report('partial', 'The navigator kept deciding the same failing step.');
-        outcome = 'fail';
-        outcomeSummary = 'repeat-decision loop';
-        return;
+        // Reject the DECISION, not the run — the navigator may have been doing
+        // good work in between (live case: it was verifying a possibly-landed
+        // post when this guard killed the whole run). MAX_REJECTIONS is the
+        // loop backstop.
+        rejections++;
+        note(
+          'step rejected: that exact action has already failed twice this run — take a DIFFERENT approach (another control, route, or surface), or confirm the outcome with an extract step instead.',
+        );
+        if (rejections >= MAX_REJECTIONS) {
+          await report('partial', 'The navigator kept deciding the same failing step.');
+          outcome = 'fail';
+          outcomeSummary = 'repeat-decision loop';
+          return;
+        }
+        continue;
       }
       if (priorFailures === 1) {
         note(
-          'warning: this exact action already failed once this run — if it fails again the run stops; prefer a different approach.',
+          'warning: this exact action already failed once this run — a second failure blocks it; prefer a different approach.',
         );
       }
 
       stepsUsed++;
-      const stepLabel = `Step ${stepsUsed}: ${describeStep(step)}`;
+      const stepLabel = `Step ${stepsUsed}: ${describeStep(step)}${step.sideEffect ? ' [side-effect]' : ''}`;
       postExecutionEvent(
         port,
         Actors.SYSTEM,
@@ -533,10 +563,15 @@ export async function runStepwiseTask(
           logger.warning('side-effect vision cross-exam failed:', error);
           return '';
         });
+        logger.info('side-effect vision cross-exam:', question.slice(0, 120), '→', answer.slice(0, 160));
         if (/^\s*yes\b/i.test(answer.trim())) {
           passed = true;
           visionConfirmed = true;
           observation = `the deterministic check failed (${observation.slice(0, 100)}) but vision confirms the action succeeded: ${answer.slice(0, 120)}`;
+        } else if (answer) {
+          // Record the second opinion either way — a transcript must show
+          // whether the cross-exam ran and what it saw
+          observation = `${observation} (vision cross-check also judged it unsuccessful: ${answer.slice(0, 100)})`;
         }
       }
 

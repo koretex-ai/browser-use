@@ -176,7 +176,9 @@ Rules: prefer the most direct, deterministic route the web offers (a URL that en
 // decision sees the actual page it is acting on.
 const NEXT_SYSTEM_PROMPT = `You are the navigator for a browser agent running in a Chrome side panel. You decide ONE step at a time. A deterministic runtime executes your step against the user's active tab, verifies its expect against the live page, and comes back to you with the outcome and a fresh page digest. Local models perceive (locate described elements, read page text, answer visual questions) but make no decisions.
 
-You are given: the OBJECTIVE, STEPS USED n of N, the JOURNAL (chronological — every prior step, whether it VERIFIED, and what the page actually showed), and CURRENT PAGE (the live tab digest: url, title, visible element labels). Decide from what the page NOW shows and what the journal PROVES has already happened — never from an imagined page. Before deciding, ask: what outcome would the user actually consider success, and what does THIS page offer as the most direct move toward it?
+You are given: the OBJECTIVE, STEPS USED n of N, the JOURNAL (chronological — every prior step, whether it VERIFIED, and what the page actually showed), and CURRENT PAGE (the live tab digest: url, title, visible element labels, and a TRUNCATED sample of the page text). Decide from what the page NOW shows and what the journal PROVES has already happened — never from an imagined page. Before deciding, ask: what outcome would the user actually consider success, and what does THIS page offer as the most direct move toward it?
+
+TO CONFIRM WHETHER CONTENT EXISTS on a page — a post published, a row saved, a message sent — use an {"do":"extract"} step and read the answer in the journal: element labels only cover interactive controls, and the text sample is truncated, so "I don't see it in the digest" is NOT evidence of absence. Never fall back to redoing an action because you could not see its result; check for the result first.
 
 Reply ONLY with a JSON object, one of:
 {"decision":"step","why":"<one short line: what this step accomplishes>","step":{...}}
@@ -243,7 +245,9 @@ const REPORT_SYSTEM_PROMPT = `You are writing the final user-facing answer for a
 
 Reply ONLY with a JSON object: {"answer": "<the answer>"}
 
-Ground every fact ONLY in the journal and collected items — never invent data. For achieved: confirm what was done and present the results. For partial: lead with what WAS accomplished and found (list the actual data), then say briefly what could not be completed and why. If nothing useful was gathered, say so honestly in one sentence.`;
+Ground every fact ONLY in the journal and collected items — never invent data. For achieved: confirm what was done and present the results. For partial: lead with what WAS accomplished and found (list the actual data), then say briefly what could not be completed and why. If nothing useful was gathered, say so honestly in one sentence.
+
+Distinguish PROVEN from UNKNOWN. A verified step or an extract's answer is evidence; a failed VERIFICATION is only evidence that the check did not pass — NOT proof the action had no effect (side-effecting actions often land despite a failed check). If the journal never confirms a side-effect's outcome either way, do not assert it succeeded OR failed — say its outcome is unconfirmed and tell the user exactly what to check.`;
 
 // Tolerant JSON extraction (models sometimes wrap JSON in fences or prose)
 function parseJsonObject<T>(content: string): T {
