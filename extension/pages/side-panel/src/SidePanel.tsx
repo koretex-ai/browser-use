@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { FiSettings } from 'react-icons/fi';
-import { PiPlusBold } from 'react-icons/pi';
+import { PiPlusBold, PiGraduationCapBold } from 'react-icons/pi';
 import { GrHistory } from 'react-icons/gr';
 import { type Message, Actors, chatHistoryStore, trajectoryStore } from '@extension/storage';
 import favoritesStorage, { type FavoritePrompt } from '@extension/storage/lib/prompt/favorites';
@@ -762,11 +762,11 @@ const SidePanel = () => {
                   type="button"
                   onClick={handleTeach}
                   onKeyDown={e => e.key === 'Enter' && handleTeach()}
-                  className={`header-icon cursor-pointer text-base leading-none ${teachPhase ? 'opacity-40' : ''} text-[#2BE87D] hover:text-[#59F09C]`}
+                  className={`header-icon cursor-pointer ${teachPhase ? 'opacity-40' : ''} text-[#2BE87D] hover:text-[#59F09C]`}
                   aria-label="Teach a skill by demonstrating it"
                   title="Teach a skill: record yourself doing a task"
                   tabIndex={0}>
-                  🎓
+                  <PiGraduationCapBold size={20} />
                 </button>
                 <button
                   type="button"
