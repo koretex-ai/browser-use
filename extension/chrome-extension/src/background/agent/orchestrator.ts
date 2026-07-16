@@ -266,6 +266,8 @@ export interface ReviewArgs {
   activeStrategy?: string;
   /** Rendered site playbooks applicable this turn (skills.ts) */
   skills?: string;
+  /** One-line index of the user's OTHER playbooks */
+  skillCatalog?: string;
   stuckSignal: string;
   timeRemainingMin?: number;
 }
@@ -283,6 +285,9 @@ export async function strategicReview(
     (args.activeStrategy ? `\n\nACTIVE STRATEGY (already in force — it has NOT worked):\n${args.activeStrategy}` : '') +
     (args.skills
       ? `\n\nSITE PLAYBOOKS (proven notes for the sites this task involves — factor them into the diagnosis and strategy):\n${args.skills}`
+      : '') +
+    (args.skillCatalog
+      ? `\n\nOTHER PLAYBOOKS THE USER HAS (one line each — if one covers the objective, route the strategy through its site):\n${args.skillCatalog}`
       : '') +
     (args.pageDigest ? `\n\nCURRENT PAGE (the active tab right now):\n${args.pageDigest}` : '') +
     journalSection(args.journal);
@@ -311,6 +316,8 @@ export interface NextArgs {
   activeStrategy?: string;
   /** Rendered site playbooks applicable this turn (skills.ts), pinned like the strategy */
   skills?: string;
+  /** One-line index of the user's OTHER playbooks (not in force this turn) */
+  skillCatalog?: string;
   /** Screenshot of the tab as it looks now (data URL); omit if capture failed */
   screenshotDataUrl?: string;
 }
@@ -335,8 +342,11 @@ export async function nextStep(
   const skillsSection = args.skills
     ? `\n\nSITE PLAYBOOKS (proven notes for the sites this task involves — strong priors, not orders; the live page wins over any note it contradicts):\n${args.skills}`
     : '';
+  const catalogSection = args.skillCatalog
+    ? `\n\nOTHER PLAYBOOKS THE USER HAS (one line each — full notes activate when you are on their site or the task matches; when one covers the objective, PREFER its site and route over improvising):\n${args.skillCatalog}`
+    : '';
   const buildContent = (withScreenshot: boolean) =>
-    `OBJECTIVE: ${args.objective}${budgetLine}${strategySection}${skillsSection}` +
+    `OBJECTIVE: ${args.objective}${budgetLine}${strategySection}${skillsSection}${catalogSection}` +
     lastSection +
     pageSection +
     (withScreenshot
@@ -830,7 +840,7 @@ Write the playbook the way an expert would brief a colleague:
 Also derive:
 - "name": short kebab-case, named for the operation (e.g. "notion-new-page").
 - "hosts": URL substrings (host + optional path prefix) of the sites ACTED ON in the demo — these trigger the skill when a tab matches.
-- "intent": a case-insensitive regex source matching how a user would PHRASE tasks this skill serves (alternatives separated by |). It fires the skill before any site is open, so make it about the task, not the site chrome.
+- "intent": a case-insensitive regex source matching how a user would PHRASE tasks this skill serves. GENEROUS and order-free: single distinctive topic words as alternatives ("solana|birdeye|token" style), never multi-word ordered phrases like "top.*token.*solana" — users phrase tasks unpredictably and a missed match means the skill silently never fires.
 - "questions": up to 3 SHORT questions, only where the demonstration is genuinely ambiguous about generality or purpose ("Is this URL always the starting point?", "Should this apply to all X or only Y?"). Empty array if nothing important is unclear. If INTERVIEW ANSWERS are present, fold them in and return few or no new questions.
 
 Reply ONLY with JSON: {"name":"...","hosts":["..."],"intent":"...","guidance":"<lines separated by \\n>","questions":["..."]}`;

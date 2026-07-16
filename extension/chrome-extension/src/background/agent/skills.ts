@@ -134,3 +134,23 @@ export function applicableSkills(objective: string, urlPath: string, skills: Ski
 export function renderSkills(skills: Skill[]): string {
   return skills.map(skill => `● ${skill.name}\n${skill.guidance}`).join('\n\n');
 }
+
+/**
+ * One-line index of playbooks NOT currently in force. The full text of a
+ * skill pins only when its site/task trigger fires — but a site-triggered
+ * skill can never fire if the navigator doesn't know to GO to its site
+ * (live failure: a birdeye.so skill never activated because the navigator
+ * improvised a different token site). The catalog closes that loop: the
+ * navigator always sees what exists and where.
+ */
+export function skillCatalog(skills: Skill[], activeNames: Set<string>): string {
+  return skills
+    .filter(skill => !activeNames.has(skill.name))
+    .map(skill => {
+      const summary = skill.guidance.split('\n')[0].slice(0, 100);
+      const sites = skill.hosts.length ? ` — sites: ${skill.hosts.join(', ')}` : '';
+      return `· ${skill.name}${sites} — ${summary}`;
+    })
+    .join('\n')
+    .slice(0, 1600);
+}

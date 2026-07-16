@@ -5,7 +5,7 @@ import { postExecutionEvent } from '../events';
 import { capturePageState } from '../perception';
 import { streamCloudChatReply } from './chat';
 import { nextStep, strategicReview, reportOutcome, curateCollection } from './orchestrator';
-import { allSkills, applicableSkills, renderSkills } from './skills';
+import { allSkills, applicableSkills, renderSkills, skillCatalog } from './skills';
 import { armDialogGuard } from '../actions/cdp';
 import type { ProgramStep, CallUsage } from './orchestrator';
 import { createStepRunner, describeStep, listLines, itemKey } from './program';
@@ -400,6 +400,9 @@ export async function runStepwiseTask(
           screenshotDataUrl: observed.screenshot,
           activeStrategy: activeStrategy || undefined,
           skills: renderSkills(applicableSkills(goalText, currentUrlPath, skillSet)) || undefined,
+          skillCatalog:
+            skillCatalog(skillSet, new Set(applicableSkills(goalText, currentUrlPath, skillSet).map(s => s.name))) ||
+            undefined,
           stuckSignal,
           timeRemainingMin: Math.max(0, Math.round((deadline - Date.now()) / 60_000)),
         },
@@ -527,6 +530,7 @@ export async function runStepwiseTask(
             timeRemainingMin: Math.max(0, Math.round((deadline - Date.now()) / 60_000)),
             activeStrategy: activeStrategy || undefined,
             skills: renderSkills(activeSkills) || undefined,
+            skillCatalog: skillCatalog(skillSet, new Set(activeSkills.map(s => s.name))) || undefined,
             screenshotDataUrl: observed.screenshot,
           },
           signal,
