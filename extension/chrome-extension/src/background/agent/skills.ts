@@ -42,7 +42,8 @@ export const SKILLS: Skill[] = [
       'Create a new spreadsheet by navigating DIRECTLY to https://docs.google.com/spreadsheets/create — never click the "Blank spreadsheet" card on the Sheets home page (its visible label is not the clickable element; those clicks miss).',
       'The grid is a canvas: type with type_focused into the SELECTED cell. A fresh sheet opens with A1 already selected — type immediately, no click needed. Tab moves one column right; Enter commits and moves to the next row. Write multi-row data as ONE type_focused step: one line per row, tab-separated columns.',
       'Never press select-all in the grid — it selects every CELL (the Name Box left of the formula bar shows "1:1000") and typing lands nowhere; press Escape if that happens. To clear cells, select them and press Delete.',
-      'The grid is invisible to text extraction — verify what was written from the screenshot. Rename the file via the "Untitled spreadsheet" title box at the top.',
+      'The grid is invisible to text extraction — verify what was written from the screenshot. Rename the file via the "Untitled spreadsheet" title box at the top, then press Enter to COMMIT the rename — the title box keeps keyboard focus until then, and grid typing would land in the title instead.',
+      'Data destined for a sheet must be collected as one ROW per item — each item one line with tab-separated fields ("Name<TAB>Title<TAB>Location"). Fields collected as separate items stack vertically in column A when written.',
     ].join('\n'),
   },
   {

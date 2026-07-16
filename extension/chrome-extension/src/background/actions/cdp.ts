@@ -247,12 +247,24 @@ async function cdpChar(tabId: number, ch: string): Promise<void> {
  * the screenshot and clear them explicitly.
  */
 export async function cdpTypeFocused(tabId: number, text: string): Promise<void> {
+  // Grid-style payload (tab-separated columns): after Enter commits a row,
+  // Sheets moves DOWN from the CURRENT column — the "return to the column
+  // where the row started" behavior of physical keyboards is not honored for
+  // CDP-dispatched Tab/Enter, so each row started one column further right
+  // (live diagonal, 2026-07-16). Press Home after each Enter to return to
+  // the row's first column explicitly. Only for tabbed payloads — Home means
+  // other things in text editors.
+  const grid = text.includes('\t');
   let segmentStart = true;
   for (const ch of text) {
     if (ch === '\r') continue; // \r\n → one Enter, not two
     if (ch === '\n' || ch === '\t') {
       await cdpKey(tabId, ch === '\n' ? 'Enter' : 'Tab');
       await sleep(COMMIT_SETTLE_MS);
+      if (ch === '\n' && grid) {
+        await cdpKey(tabId, 'Home');
+        await sleep(CHAR_MS);
+      }
       segmentStart = true;
       continue;
     }
