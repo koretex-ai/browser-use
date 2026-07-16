@@ -5,6 +5,7 @@ import { postExecutionEvent } from '../events';
 import { capturePageState } from '../perception';
 import { streamCloudChatReply } from './chat';
 import { nextStep, strategicReview, reportOutcome, curateCollection } from './orchestrator';
+import { skillsFor } from './skills';
 import type { ProgramStep, CallUsage } from './orchestrator';
 import { createStepRunner, describeStep, listLines, itemKey } from './program';
 
@@ -377,6 +378,7 @@ export async function runStepwiseTask(
           pageDigest: observed.digest,
           screenshotDataUrl: observed.screenshot,
           activeStrategy: activeStrategy || undefined,
+          skills: skillsFor(goalText, currentUrlPath) || undefined,
           stuckSignal,
           timeRemainingMin: Math.max(0, Math.round((deadline - Date.now()) / 60_000)),
         },
@@ -489,6 +491,7 @@ export async function runStepwiseTask(
             maxSteps: MAX_STEPS,
             timeRemainingMin: Math.max(0, Math.round((deadline - Date.now()) / 60_000)),
             activeStrategy: activeStrategy || undefined,
+            skills: skillsFor(goalText, currentUrlPath) || undefined,
             screenshotDataUrl: observed.screenshot,
           },
           signal,

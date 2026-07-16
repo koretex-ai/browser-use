@@ -192,11 +192,11 @@ SIDE EFFECTS — a step that posts, sends, submits a form, purchases, or deletes
 
 WRITING COLLECTED DATA: a type/type_focused step may use "textFrom":"collected" — the runtime inserts EVERY item collected so far, complete and verbatim, below the optional "text" (which becomes a header line). This is the ONLY reliable way to write a collected dataset — journal digests are truncated, so never paste them into "text" yourself. Have harvest/extract queries request each item ALREADY IN THE FORM it should appear at the destination (tab-separated only where tabs are meaningful, e.g. a spreadsheet grid).
 
-Canvas-rendered editors (e.g. Google Docs/Sheets) render input literally, not as markup — type into them with type_focused (they focus themselves when opened; clicking around first can steal focus). type_focused INSERTS at the focus — it does NOT clear existing content; if a failed earlier attempt left partial content behind, restore a clean state first (in a text editor: select-all then retype; in a grid: select the cells and delete). GOOGLE SHEETS specifically: typing goes into the SELECTED CELL; Tab moves one column right, Enter commits and moves one row down — so select the starting cell (A1 for a fresh sheet), then type_focused rows as tab-separated columns with one row per line. Never press select-all in a spreadsheet grid (it selects every cell, not text).`;
+Canvas-rendered editors (e.g. Google Docs/Sheets) render input literally, not as markup — type into them with type_focused (they focus themselves when opened; clicking around first can steal focus). type_focused INSERTS at the focus — it does NOT clear existing content; if a failed earlier attempt left partial content behind, restore a clean state first (in a text editor: select-all then retype; in a grid: select the cells and delete — never select-all in a grid, it selects cells, not text).`;
 
 const NEXT_SYSTEM_PROMPT = `You are the navigator for a browser agent. You work ONE step at a time: a deterministic runtime executes each step you decide against the user's active tab, then returns to you with a fresh SCREENSHOT of the tab, a page digest, and the journal. Local models handle perception details (locating elements to click, bulk-reading page text); you make every decision.
 
-You are given: the OBJECTIVE, STEPS USED plus TIME REMAINING, sometimes an ACTIVE STRATEGY (standing orders from a deeper strategic review — always follow it), LAST ACTION (the step just executed and what the executor reported), CURRENT PAGE (url, title, visible element labels, truncated page-text sample), the JOURNAL (chronological history: every step, your judgment of it, and data collected), and the SCREENSHOT of the tab as it looks right now.
+You are given: the OBJECTIVE, STEPS USED plus TIME REMAINING, sometimes an ACTIVE STRATEGY (standing orders from a deeper strategic review — always follow it), sometimes SITE PLAYBOOKS (proven notes on how the sites involved actually work — strong priors that spare you rediscovering routes and traps, but the live page always wins: if the screenshot contradicts a note, trust the screenshot), LAST ACTION (the step just executed and what the executor reported), CURRENT PAGE (url, title, visible element labels, truncated page-text sample), the JOURNAL (chronological history: every step, your judgment of it, and data collected), and the SCREENSHOT of the tab as it looks right now.
 
 YOUR FIRST JOB EVERY TURN IS TO JUDGE. Look at the screenshot and state what you actually see and what the LAST ACTION accomplished — as evidence, not hope: "the composer is open and empty", "the post now appears at the top of the feed", "a dialog is asking to confirm deletion", "the page is still loading". Then rule the last action succeeded, failed, or uncertain. Judge ONLY from visible evidence; wanting it to have worked is not evidence. If the page looks mid-load (spinners, blank regions), say so and prefer a short {"do":"wait"} over guessing.
 
@@ -264,6 +264,8 @@ export interface ReviewArgs {
   pageDigest?: string;
   screenshotDataUrl?: string;
   activeStrategy?: string;
+  /** Rendered site playbooks applicable this turn (skills.ts) */
+  skills?: string;
   stuckSignal: string;
   timeRemainingMin?: number;
 }
@@ -279,6 +281,9 @@ export async function strategicReview(
     (args.timeRemainingMin !== undefined ? `\nTIME REMAINING: about ${args.timeRemainingMin} minute(s)` : '') +
     `\n\nSTUCK SIGNAL: ${args.stuckSignal}` +
     (args.activeStrategy ? `\n\nACTIVE STRATEGY (already in force — it has NOT worked):\n${args.activeStrategy}` : '') +
+    (args.skills
+      ? `\n\nSITE PLAYBOOKS (proven notes for the sites this task involves — factor them into the diagnosis and strategy):\n${args.skills}`
+      : '') +
     (args.pageDigest ? `\n\nCURRENT PAGE (the active tab right now):\n${args.pageDigest}` : '') +
     journalSection(args.journal);
   const { value, usage } = await callOrchestrator<ReviewResult>(REVIEW_SYSTEM_PROMPT, content, signal, onProgress, {
@@ -304,6 +309,8 @@ export interface NextArgs {
   timeRemainingMin?: number;
   /** Standing orders from the last strategic review, pinned into every turn */
   activeStrategy?: string;
+  /** Rendered site playbooks applicable this turn (skills.ts), pinned like the strategy */
+  skills?: string;
   /** Screenshot of the tab as it looks now (data URL); omit if capture failed */
   screenshotDataUrl?: string;
 }
@@ -325,8 +332,11 @@ export async function nextStep(
   const strategySection = args.activeStrategy
     ? `\n\nACTIVE STRATEGY (standing orders from a strategic review after earlier approaches failed — FOLLOW THIS, and do not retry what it rules out):\n${args.activeStrategy}`
     : '';
+  const skillsSection = args.skills
+    ? `\n\nSITE PLAYBOOKS (proven notes for the sites this task involves — strong priors, not orders; the live page wins over any note it contradicts):\n${args.skills}`
+    : '';
   const buildContent = (withScreenshot: boolean) =>
-    `OBJECTIVE: ${args.objective}${budgetLine}${strategySection}` +
+    `OBJECTIVE: ${args.objective}${budgetLine}${strategySection}${skillsSection}` +
     lastSection +
     pageSection +
     (withScreenshot
