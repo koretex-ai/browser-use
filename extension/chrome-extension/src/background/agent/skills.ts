@@ -54,6 +54,7 @@ export const SKILLS: Skill[] = [
     intent: /\bgoogle docs?\b|\bdocument\b/i,
     guidance: [
       'Create a new document by navigating DIRECTLY to https://docs.google.com/document/create.',
+      'Write the BODY FIRST and rename LAST. Renaming focuses the "Untitled document" title box and it KEEPS keyboard focus until Enter commits it — body text typed right after renaming lands in the title instead (live run: the first body line was appended to the title).',
       'The page is a canvas editor: it focuses itself when opened — type_focused immediately; clicking around first can steal focus. Text renders literally (never markup). Separate fields with " — ", not tabs. The document title is the separate "Untitled document" box at the top-left, not the page body.',
       'The canvas is invisible to text extraction — verify what was written from the screenshot.',
     ].join('\n'),

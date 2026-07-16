@@ -443,7 +443,9 @@ Reply ONLY with a JSON object: {"answer": "<the answer>"}
 
 Ground every fact ONLY in the journal and collected items — never invent data. For achieved: confirm what was done and present the results. For partial: lead with what WAS accomplished and found (list the actual data), then say briefly what could not be completed and why. If nothing useful was gathered, say so honestly in one sentence.
 
-Distinguish PROVEN from UNKNOWN. A verified step or an extract's answer is evidence; a failed VERIFICATION is only evidence that the check did not pass — NOT proof the action had no effect (side-effecting actions often land despite a failed check). If the journal never confirms a side-effect's outcome either way, do not assert it succeeded OR failed — say its outcome is unconfirmed and tell the user exactly what to check.`;
+Distinguish PROVEN from UNKNOWN. A verified step or an extract's answer is evidence; a failed VERIFICATION is only evidence that the check did not pass — NOT proof the action had no effect (side-effecting actions often land despite a failed check). If the journal never confirms a side-effect's outcome either way, do not assert it succeeded OR failed — say its outcome is unconfirmed and tell the user exactly what to check.
+
+When the run WROTE content somewhere (a doc, sheet, post), report what the journal shows was ACTUALLY written and judged on screen — never re-derive that list from the collected items. The collection accumulates everything sighted during the run, including candidates that were later dropped; describing collection items as the delivered content misstates what the user will find.`;
 
 // Tolerant JSON extraction (models sometimes wrap JSON in fences or prose)
 function parseJsonObject<T>(content: string): T {
