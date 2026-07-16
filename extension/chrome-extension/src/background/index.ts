@@ -3,6 +3,7 @@ import { createLogger } from './log';
 import { handleCommand } from './commands';
 import { runAgentTask } from './agent/loop';
 import { streamChatReply } from './agent/chat';
+import { handleTeachMessage } from './recorder/teach';
 
 const logger = createLogger('background');
 
@@ -10,6 +11,7 @@ const SIDE_PANEL_URL = chrome.runtime.getURL('side-panel/index.html');
 
 let currentPort: chrome.runtime.Port | null = null;
 let currentAbort: AbortController | null = null;
+let teachAbort: AbortController | null = null;
 
 // Setup side panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(error => console.error(error));
@@ -80,6 +82,18 @@ chrome.runtime.onConnect.addListener(port => {
           break;
         }
 
+        case 'teach_start':
+        case 'teach_note':
+        case 'teach_stop':
+        case 'teach_answer':
+        case 'teach_save':
+        case 'teach_discard': {
+          teachAbort ??= new AbortController();
+          await handleTeachMessage(m => port.postMessage(m), message, teachAbort.signal);
+          if (message.type === 'teach_save' || message.type === 'teach_discard') teachAbort = null;
+          break;
+        }
+
         default:
           return port.postMessage({ type: 'error', error: `Unknown command: ${message.type}` });
       }
@@ -98,5 +112,7 @@ chrome.runtime.onConnect.addListener(port => {
       currentPort = null;
     }
     currentAbort?.abort();
+    teachAbort?.abort();
+    teachAbort = null;
   });
 });

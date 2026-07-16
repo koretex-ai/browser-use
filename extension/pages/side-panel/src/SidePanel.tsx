@@ -35,6 +35,8 @@ const SidePanel = () => {
   const [favoritePrompts, setFavoritePrompts] = useState<FavoritePrompt[]>([]);
   // null = not streaming; '' = waiting for first token; otherwise partial reply
   const [streamingText, setStreamingText] = useState<string | null>(null);
+  // Teach-by-demonstration flow: null = not teaching
+  const [teachPhase, setTeachPhase] = useState<null | 'recording' | 'distilling' | 'reviewing'>(null);
   const sessionIdRef = useRef<string | null>(null);
   const portRef = useRef<chrome.runtime.Port | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
@@ -166,6 +168,18 @@ const SidePanel = () => {
           finishTask();
         } else if (message && message.type === 'heartbeat_ack') {
           console.log('Heartbeat acknowledged');
+        } else if (message && typeof message.type === 'string' && message.type.startsWith('teach_')) {
+          const content = message.message ?? message.text ?? message.error ?? '';
+          if (content) {
+            appendMessage({
+              actor: message.type === 'teach_draft' || message.type === 'teach_saved' ? Actors.ASSISTANT : Actors.SYSTEM,
+              content,
+              timestamp: Date.now(),
+            });
+          }
+          if (message.teachPhase) {
+            setTeachPhase(message.teachPhase === 'idle' ? null : message.teachPhase);
+          }
         }
       });
 
@@ -390,6 +404,23 @@ const SidePanel = () => {
       return;
     }
 
+    // Teach mode: the input feeds the recording (notes) or the draft review
+    // (interview answers) instead of starting a task
+    if (teachPhase === 'distilling') return;
+    if (teachPhase === 'recording' || teachPhase === 'reviewing') {
+      appendMessage({ actor: Actors.USER, content: trimmedText, timestamp: Date.now() });
+      try {
+        sendMessage({ type: teachPhase === 'recording' ? 'teach_note' : 'teach_answer', text: trimmedText });
+      } catch (err) {
+        appendMessage({
+          actor: Actors.SYSTEM,
+          content: err instanceof Error ? err.message : String(err),
+          timestamp: Date.now(),
+        });
+      }
+      return;
+    }
+
     try {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
       const tabId = tabs[0]?.id;
@@ -459,7 +490,33 @@ const SidePanel = () => {
     finishTask();
   };
 
+  const sendTeach = useCallback(
+    (message: { type: string; tabId?: number; text?: string }) => {
+      try {
+        if (!portRef.current) setupConnection();
+        sendMessage(message);
+      } catch (err) {
+        appendMessage({
+          actor: Actors.SYSTEM,
+          content: err instanceof Error ? err.message : String(err),
+          timestamp: Date.now(),
+        });
+        setTeachPhase(null);
+      }
+    },
+    [sendMessage, setupConnection, appendMessage],
+  );
+
+  const handleTeach = async () => {
+    if (teachPhase || !inputEnabled || isHistoricalSession) return;
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    setTeachPhase('recording');
+    sendTeach({ type: 'teach_start', tabId: tabs[0]?.id });
+  };
+
   const handleNewChat = () => {
+    if (teachPhase) sendTeach({ type: 'teach_discard' });
+    setTeachPhase(null);
     // Clear messages and start a new chat
     setMessages([]);
     setCurrentSessionId(null);
@@ -639,6 +696,48 @@ const SidePanel = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, streamingText]);
 
+  const teachBar = teachPhase && (
+    <div className="mx-2 mb-1 flex items-center justify-between gap-2 rounded-md border border-[#1F7A4A]/50 bg-[#0E1D14] px-3 py-2 text-xs text-gray-300">
+      <span>
+        {teachPhase === 'recording' && '⏺ Recording your demonstration — act in the page, type notes below'}
+        {teachPhase === 'distilling' && '⏳ Distilling the skill from your demonstration…'}
+        {teachPhase === 'reviewing' && '📘 Draft ready — reply below to refine it, or save'}
+      </span>
+      <span className="flex shrink-0 gap-2">
+        {teachPhase === 'recording' && (
+          <button
+            type="button"
+            onClick={() => {
+              setTeachPhase('distilling');
+              sendTeach({ type: 'teach_stop' });
+            }}
+            className="rounded bg-[#2BE87D] px-2 py-0.5 font-medium text-[#06130C] hover:bg-[#59F09C]">
+            Finish
+          </button>
+        )}
+        {teachPhase === 'reviewing' && (
+          <button
+            type="button"
+            onClick={() => sendTeach({ type: 'teach_save' })}
+            className="rounded bg-[#2BE87D] px-2 py-0.5 font-medium text-[#06130C] hover:bg-[#59F09C]">
+            Save skill
+          </button>
+        )}
+        {teachPhase !== 'distilling' && (
+          <button
+            type="button"
+            onClick={() => {
+              setTeachPhase(null);
+              sendTeach({ type: 'teach_discard' });
+            }}
+            className="rounded border border-[#1F7A4A]/60 px-2 py-0.5 text-gray-400 hover:text-gray-200">
+            Discard
+          </button>
+        )}
+      </span>
+    </div>
+  );
+
   return (
     <div>
       <div className="flex h-screen flex-col overflow-hidden rounded-2xl border border-[#1F7A4A]/40 bg-[#0A150F]">
@@ -659,6 +758,16 @@ const SidePanel = () => {
           <div className="header-icons">
             {!showHistory && (
               <>
+                <button
+                  type="button"
+                  onClick={handleTeach}
+                  onKeyDown={e => e.key === 'Enter' && handleTeach()}
+                  className={`header-icon cursor-pointer text-base leading-none ${teachPhase ? 'opacity-40' : ''} text-[#2BE87D] hover:text-[#59F09C]`}
+                  aria-label="Teach a skill by demonstrating it"
+                  title="Teach a skill: record yourself doing a task"
+                  tabIndex={0}>
+                  🎓
+                </button>
                 <button
                   type="button"
                   onClick={handleNewChat}
@@ -705,6 +814,7 @@ const SidePanel = () => {
           <>
             {displayMessages.length === 0 && (
               <>
+                {teachBar}
                 <div
                   className={`border-t ${isDarkMode ? 'border-[#123D2B]' : 'border-[#123D2B]'} mb-2 p-2 shadow-sm backdrop-blur-sm`}>
                   <ChatInput
@@ -740,6 +850,7 @@ const SidePanel = () => {
             {displayMessages.length > 0 && (
               <div
                 className={`border-t ${isDarkMode ? 'border-[#123D2B]' : 'border-[#123D2B]'} p-2 shadow-sm backdrop-blur-sm`}>
+                {teachBar}
                 <ChatInput
                   onSendMessage={handleSendMessage}
                   onStopTask={handleStopTask}

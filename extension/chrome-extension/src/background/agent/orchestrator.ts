@@ -811,3 +811,69 @@ export async function reportOutcome(
   if (!value.answer) throw new Error('Report returned no answer');
   return { answer: value.answer, usage };
 }
+
+// ---- DISTILL (teach-by-demonstration → skill draft) ----
+// The user demonstrated a task by hand while the extension recorded a
+// semantic event log; this call turns demonstration + notes into a SKILL —
+// a playbook the navigator reads as a prior, never a replayable macro.
+const DISTILL_SYSTEM_PROMPT = `You are distilling a user's hand-performed browser demonstration into a SKILL for a browser agent. A skill is a short playbook of site knowledge the agent reads as a STRONG PRIOR while working — the agent still judges every step from the live page, so a skill teaches routes, traps, and expectations; it is NEVER a literal macro.
+
+You get the DEMONSTRATION (a chronological event log: navigations with URLs, clicks with element descriptions, typed text, key presses), the user's NOTES (typed while demonstrating — these carry the WHY and outrank your inferences), and possibly INTERVIEW ANSWERS from a previous round.
+
+Write the playbook the way an expert would brief a colleague:
+- Capture the CANONICAL ROUTE: exact URLs that encode the operation (a visited URL that creates/searches directly is gold), the order of surfaces, which controls matter.
+- Capture TRAPS the notes or the demonstration reveal (things avoided, retried, or warned about).
+- GENERALIZE task-specific values into their role ("the user's search keywords", "the text to post") — never hard-code the demo's literals except URLs/controls that are part of the route.
+- State only what the demonstration and notes support. Do not invent site knowledge.
+- 3-6 short lines. Plain language. No numbering needed.
+
+Also derive:
+- "name": short kebab-case, named for the operation (e.g. "notion-new-page").
+- "hosts": URL substrings (host + optional path prefix) of the sites ACTED ON in the demo — these trigger the skill when a tab matches.
+- "intent": a case-insensitive regex source matching how a user would PHRASE tasks this skill serves (alternatives separated by |). It fires the skill before any site is open, so make it about the task, not the site chrome.
+- "questions": up to 3 SHORT questions, only where the demonstration is genuinely ambiguous about generality or purpose ("Is this URL always the starting point?", "Should this apply to all X or only Y?"). Empty array if nothing important is unclear. If INTERVIEW ANSWERS are present, fold them in and return few or no new questions.
+
+Reply ONLY with JSON: {"name":"...","hosts":["..."],"intent":"...","guidance":"<lines separated by \\n>","questions":["..."]}`;
+
+export interface SkillDraft {
+  name: string;
+  hosts: string[];
+  intent?: string;
+  guidance: string;
+  questions?: string[];
+}
+
+export interface TeachInput {
+  events: string[];
+  notes: string[];
+  qa: { question: string; answer: string }[];
+  priorDraft?: SkillDraft;
+}
+
+export async function distillSkill(
+  input: TeachInput,
+  signal: AbortSignal,
+  onProgress?: ProgressFn,
+): Promise<{ result: SkillDraft; usage: CallUsage }> {
+  const content =
+    `DEMONSTRATION (chronological):\n${input.events.join('\n') || '(no events were recorded)'}` +
+    (input.notes.length ? `\n\nNOTES from the user while demonstrating:\n${input.notes.join('\n')}` : '') +
+    (input.priorDraft
+      ? `\n\nPREVIOUS DRAFT (refine this using the interview answers):\n${JSON.stringify(input.priorDraft)}`
+      : '') +
+    (input.qa.length
+      ? `\n\nINTERVIEW ANSWERS:\n${input.qa.map(({ question, answer }) => `Q: ${question}\nA: ${answer}`).join('\n')}`
+      : '');
+  const { value, usage } = await callOrchestrator<SkillDraft>(DISTILL_SYSTEM_PROMPT, content, signal, onProgress);
+  if (!value.name || !value.guidance) throw new Error('Distiller returned an incomplete skill draft');
+  return {
+    result: {
+      name: String(value.name).trim(),
+      hosts: (value.hosts ?? []).map(host => String(host).trim()).filter(Boolean),
+      intent: value.intent ? String(value.intent) : undefined,
+      guidance: String(value.guidance),
+      questions: (value.questions ?? []).map(question => String(question)).filter(Boolean),
+    },
+    usage,
+  };
+}
