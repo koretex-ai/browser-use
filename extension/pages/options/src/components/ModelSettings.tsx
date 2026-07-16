@@ -119,7 +119,7 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
 
       <div>
         <label htmlFor="chat-model" className={labelClass}>
-          Chat model
+          Local reader model
         </label>
         {availableModels.length > 0 ? (
           <select id="chat-model" value={model} onChange={e => setModel(e.target.value)} className={inputClass}>
@@ -140,6 +140,10 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
             className={inputClass}
           />
         )}
+        <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+          Bulk-reads page text for extract/harvest steps — full pages never leave your machine, only compact digests
+          do. Also answers plain chat when the cloud orchestrator is off.
+        </p>
       </div>
 
       <div>
@@ -172,7 +176,9 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
           />
         )}
         <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-          Locates elements on screenshots when they are missing from the DOM (used as a fallback).
+          Turns element descriptions (&quot;the Post button inside the composer&quot;) into click coordinates from a
+          screenshot — how clicks land on canvas UIs and ambiguous labels. Runs locally; grounding never goes to the
+          cloud.
         </p>
       </div>
 
