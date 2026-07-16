@@ -831,6 +831,7 @@ const DISTILL_SYSTEM_PROMPT = `You are distilling a user's hand-performed browse
 You get the DEMONSTRATION (a chronological event log: navigations with URLs, clicks with element descriptions, typed text, key presses), the user's NOTES (typed while demonstrating — these carry the WHY and outrank your inferences), and possibly INTERVIEW ANSWERS from a previous round.
 
 Write the playbook the way an expert would brief a colleague:
+- The FIRST LINE must state the skill's PURPOSE: what it accomplishes and when to reach for it, naming the site (e.g. "Find top-performing new Solana tokens on birdeye.so."). This line doubles as the skill's entry in a catalog the agent always sees — it is how the skill gets FOUND, so it must describe the goal, never a mid-flow detail.
 - Capture the CANONICAL ROUTE: exact URLs that encode the operation (a visited URL that creates/searches directly is gold), the order of surfaces, which controls matter.
 - Capture TRAPS the notes or the demonstration reveal (things avoided, retried, or warned about).
 - GENERALIZE task-specific values into their role ("the user's search keywords", "the text to post") — never hard-code the demo's literals except URLs/controls that are part of the route.
@@ -841,7 +842,7 @@ Also derive:
 - "name": short kebab-case, named for the operation (e.g. "notion-new-page").
 - "hosts": URL substrings (host + optional path prefix) of the sites ACTED ON in the demo — these trigger the skill when a tab matches.
 - "intent": a case-insensitive regex source matching how a user would PHRASE tasks this skill serves. GENEROUS and order-free: single distinctive topic words as alternatives ("solana|birdeye|token" style), never multi-word ordered phrases like "top.*token.*solana" — users phrase tasks unpredictably and a missed match means the skill silently never fires.
-- "questions": up to 3 SHORT questions, only where the demonstration is genuinely ambiguous about generality or purpose ("Is this URL always the starting point?", "Should this apply to all X or only Y?"). Empty array if nothing important is unclear. If INTERVIEW ANSWERS are present, fold them in and return few or no new questions.
+- "questions": up to 3 SHORT questions. On the FIRST round (no INTERVIEW ANSWERS yet), the first question must always confirm the skill's key objective in the user's own words ("What should this skill accomplish — when should the agent use it?") unless the notes already state it explicitly. Further questions only where the demonstration is genuinely ambiguous about generality ("Is this URL always the starting point?", "Should this apply to all X or only Y?"). If INTERVIEW ANSWERS are present, fold them in and return few or no new questions.
 
 Reply ONLY with JSON: {"name":"...","hosts":["..."],"intent":"...","guidance":"<lines separated by \\n>","questions":["..."]}`;
 

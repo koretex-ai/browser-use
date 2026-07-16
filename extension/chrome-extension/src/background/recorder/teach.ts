@@ -317,6 +317,17 @@ export async function handleTeachMessage(
       });
       try {
         const { result } = await distillSkill({ events: session.events, notes: session.notes, qa: [] }, signal);
+        // The objective question is non-negotiable on the first round: the
+        // user's own statement of purpose becomes the playbook's first line
+        // (and thus the skill's catalog entry) — guarantee it in code even
+        // if the distiller skipped it
+        const asksObjective = (result.questions ?? []).some(q => /objective|purpose|accomplish|goal/i.test(q));
+        if (!asksObjective && session.notes.length === 0) {
+          result.questions = [
+            'What is the key objective of this skill — what should it accomplish, and when should the agent use it?',
+            ...(result.questions ?? []),
+          ].slice(0, 3);
+        }
         session.draft = result;
         post({ type: 'teach_draft', draft: result, message: renderDraftMessage(result), teachPhase: 'reviewing' });
       } catch (error) {
