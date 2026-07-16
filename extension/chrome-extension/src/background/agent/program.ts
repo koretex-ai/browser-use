@@ -249,8 +249,20 @@ export function createStepRunner(
     // Cloud reading sends the FULL page text off-machine — pseudonymize
     // detectable identifiers first when the PII guard is on
     if (endpoint.kind === 'cloud' && ctx.scrubForCloud) pageText = scrubPii(pageText);
-    const { answer, usage } = await extractFromPage(query, pageText, signal, endpoint, ctx.knownData?.() ?? []);
-    if (usage) ctx.onUsage?.(usage);
+    let answer: string;
+    try {
+      const result = await extractFromPage(query, pageText, signal, endpoint, ctx.knownData?.() ?? []);
+      answer = result.answer;
+      if (result.usage) ctx.onUsage?.(result.usage);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // A reader call misfiring is a STEP failure the navigator judges and
+      // routes around — never run death (a raw JSON parse error once killed
+      // an otherwise healthy run at this exact spot)
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warning('reader call failed:', message);
+      return { newItems: 0, note: `READER ERROR: ${message.slice(0, 160)}` };
+    }
     if (/^NOTHING NEW/i.test(answer)) return { newItems: 0, note: 'nothing new' };
     if (answer.startsWith('NOT FOUND')) return { newItems: 0, note: answer.slice(0, 120) };
     let reported = answer;
@@ -433,6 +445,7 @@ export function createStepRunner(
       case 'extract': {
         if (!step.query) return { ok: false, message: 'extract step has no query' };
         const { newItems, note } = await runExtract(step.query);
+        if (note.startsWith('READER ERROR')) return { ok: false, message: note };
         // Zero-yield parity with harvest: a read that found NOTHING while the
         // task collection is still empty is a step failure the reflector must
         // see NOW — not a silent ✓ that surfaces as an empty deliverable ten

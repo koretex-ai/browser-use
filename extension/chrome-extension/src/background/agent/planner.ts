@@ -1,7 +1,7 @@
 import type { Action } from '@extension/storage';
 import { chatSettingsStore } from '@extension/storage';
 import { createLogger } from '../log';
-import { fetchWithTimeout } from '../net';
+import { fetchWithTimeout, withTimeout } from '../net';
 import type { CallUsage } from './orchestrator';
 
 const logger = createLogger('planner');
@@ -93,46 +93,81 @@ async function callLocal(
   return data.message?.content ?? '';
 }
 
-// One non-streaming call to an escalated cloud endpoint (OpenAI-compatible)
+// One non-streaming call to a cloud endpoint (OpenAI-compatible) — the
+// cloud-only mode's page reader. Carries the same resilience ladder the
+// orchestrator earned live: bounded connection AND body read, one
+// transparent retry on transients (an unguarded response.json() killed a
+// run with "Unexpected end of JSON input", 2026-07-16), no-retention
+// provider routing, and fastest-host-under-price-ceiling (an unrouted call
+// is how the navigator once landed on a 12 tok/s host).
+const CLOUD_READER_TIMEOUT_MS = 90_000;
+const CLOUD_READER_BODY_TIMEOUT_MS = 60_000;
+
+function isTransientCloudError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === 'AbortError') return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /failed to fetch|network|timed out|socket|HTTP 5\d\d|HTTP 429|Unexpected end of JSON/i.test(message);
+}
+
 async function callCloud(
   endpoint: Extract<PlannerEndpoint, { kind: 'cloud' }>,
   systemPrompt: string,
   userContent: string,
   signal: AbortSignal,
 ): Promise<{ content: string; usage: CallUsage }> {
-  const response = await fetch(`${endpoint.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${endpoint.apiKey}`,
-      'HTTP-Referer': 'https://github.com/koretex-ai/local-browser-use',
-      'X-Title': 'Local Browser Use',
-    },
-    body: JSON.stringify({
-      model: endpoint.model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userContent },
-      ],
-      temperature: 0.1,
-      // OpenRouter usage accounting: response.usage.cost in USD (ignored elsewhere)
-      usage: { include: true },
-    }),
-    signal,
-  });
-  if (!response.ok) {
-    const detail = (await response.text().catch(() => '')).slice(0, 200);
-    throw new Error(`Escalated planner request failed (HTTP ${response.status}): ${detail}`);
-  }
-  const data = await response.json();
-  if (data.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
-  const usage: CallUsage = {
-    model: data.model ?? endpoint.model,
-    cost: typeof data.usage?.cost === 'number' ? data.usage.cost : null,
-    promptTokens: data.usage?.prompt_tokens ?? null,
-    completionTokens: data.usage?.completion_tokens ?? null,
+  const attempt = async (): Promise<{ content: string; usage: CallUsage }> => {
+    const response = await fetchWithTimeout(
+      `${endpoint.baseUrl.replace(/\/$/, '')}/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${endpoint.apiKey}`,
+          'HTTP-Referer': 'https://github.com/koretex-ai/browser-use',
+          'X-Title': 'Browser Use',
+        },
+        body: JSON.stringify({
+          model: endpoint.model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
+          ],
+          temperature: 0.1,
+          usage: { include: true },
+          // Page text crosses here — no-retention providers only, fastest
+          // host under the price ceiling (same constants as the orchestrator)
+          provider: {
+            data_collection: 'deny',
+            sort: 'throughput',
+            max_price: { prompt: 0.25, completion: 0.6 },
+          },
+        }),
+      },
+      signal,
+      CLOUD_READER_TIMEOUT_MS,
+    );
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => '')).slice(0, 200);
+      throw new Error(`Cloud reader request failed (HTTP ${response.status}): ${detail}`);
+    }
+    const data = await withTimeout(response.json(), CLOUD_READER_BODY_TIMEOUT_MS, 'cloud reader body read');
+    if (data.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
+    const usage: CallUsage = {
+      model: data.model ?? endpoint.model,
+      cost: typeof data.usage?.cost === 'number' ? data.usage.cost : null,
+      promptTokens: data.usage?.prompt_tokens ?? null,
+      completionTokens: data.usage?.completion_tokens ?? null,
+    };
+    return { content: data.choices?.[0]?.message?.content ?? '', usage };
   };
-  return { content: data.choices?.[0]?.message?.content ?? '', usage };
+
+  try {
+    return await attempt();
+  } catch (error) {
+    if (!isTransientCloudError(error)) throw error;
+    logger.warning('cloud reader transient failure — retrying once:', error);
+    return attempt();
+  }
 }
 
 async function callText(
