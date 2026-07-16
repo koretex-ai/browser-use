@@ -144,11 +144,39 @@ export async function cdpKey(tabId: number, combo: string): Promise<void> {
   });
 }
 
+/** One printable character as a real keydown/keyup pair. */
+async function cdpChar(tabId: number, ch: string): Promise<void> {
+  const spec = keySpecFor(ch);
+  await send(tabId, 'Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: spec.key,
+    code: spec.code,
+    windowsVirtualKeyCode: spec.keyCode,
+    nativeVirtualKeyCode: spec.keyCode,
+    text: ch,
+    unmodifiedText: ch,
+  });
+  await send(tabId, 'Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: spec.key,
+    code: spec.code,
+    windowsVirtualKeyCode: spec.keyCode,
+    nativeVirtualKeyCode: spec.keyCode,
+  });
+}
+
 /**
- * Type text into whatever currently has keyboard focus, as trusted input.
- * Newlines become real Enter presses (Input.insertText does not translate
- * them); tabs are typed as-is (grid column moves). Works in canvas editors
- * (Google Docs/Sheets) that ignore synthetic DOM events.
+ * Type text into whatever currently has keyboard focus, as trusted input —
+ * PER-CHARACTER key events, never Input.insertText. insertText pastes into a
+ * focused text FIELD, but a selected spreadsheet grid cell is not a text
+ * field until a real keystroke opens its cell editor: an entire Sheets write
+ * landed nowhere (2026-07-16) while Delete — a real key event — worked fine.
+ * Real keydowns enter cell edit mode exactly like a physical keyboard, and
+ * still work in Docs and plain form fields (same trusted input pipeline).
+ *
+ * Tabs and newlines are pressed as real Tab/Enter keys — in a grid they move
+ * across columns / down rows (insertText treated \t as literal text, which
+ * concatenated whole rows into one cell).
  *
  * INSERT semantics — no automatic select-all. The old idempotency trick
  * (Cmd+A before typing) selected ALL CELLS in a spreadsheet GRID instead of
@@ -158,9 +186,10 @@ export async function cdpKey(tabId: number, combo: string): Promise<void> {
  * the screenshot and clear them explicitly.
  */
 export async function cdpTypeFocused(tabId: number, text: string): Promise<void> {
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i]) await send(tabId, 'Input.insertText', { text: lines[i] });
-    if (i < lines.length - 1) await cdpKey(tabId, 'Enter');
+  for (const ch of text) {
+    if (ch === '\r') continue; // \r\n → one Enter, not two
+    if (ch === '\n') await cdpKey(tabId, 'Enter');
+    else if (ch === '\t') await cdpKey(tabId, 'Tab');
+    else await cdpChar(tabId, ch);
   }
 }
