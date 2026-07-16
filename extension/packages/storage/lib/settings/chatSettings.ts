@@ -70,7 +70,9 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettingsConfig = {
   // GUI-agent-trained). Alternates: qwen/qwen3.5-122b-a10b, z-ai/glm-4.6v.
   navigatorModel: 'xiaomi/mimo-v2.5',
   cloudOnly: false,
-  cloudReaderModel: '',
+  // Same model as the navigator: cheapest serious option for input-heavy
+  // page reading, and already the most-validated model in the stack
+  cloudReaderModel: 'xiaomi/mimo-v2.5',
   piiGuard: true,
   sensitiveSites: 'bank, banking, paypal, venmo, wise.com, health, medical, clinic, insurance, medicare, centrelink, .gov, ato., irs.',
 };

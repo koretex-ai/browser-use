@@ -365,7 +365,7 @@ export async function runStepwiseTask(
             kind: 'cloud',
             baseUrl: runSettings.orchestratorBaseUrl,
             apiKey: runSettings.orchestratorApiKey,
-            model: runSettings.cloudReaderModel || runSettings.orchestratorModel,
+            model: runSettings.cloudReaderModel || runSettings.navigatorModel || runSettings.orchestratorModel,
             tier: 0,
           }
         : undefined,

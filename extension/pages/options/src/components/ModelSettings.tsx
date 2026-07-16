@@ -39,7 +39,8 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
       setOrchestratorModel(settings.orchestratorModel);
       setNavigatorModel(settings.navigatorModel);
       setCloudOnly(settings.cloudOnly);
-      setCloudReaderModel(settings.cloudReaderModel);
+      // Profiles saved before the default existed hold '' — show the default
+      setCloudReaderModel(settings.cloudReaderModel || DEFAULT_CHAT_SETTINGS.cloudReaderModel);
       setPiiGuard(settings.piiGuard);
       setSensitiveSites(settings.sensitiveSites);
     });
@@ -357,12 +358,12 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
                 type="text"
                 value={cloudReaderModel}
                 onChange={e => setCloudReaderModel(e.target.value)}
-                placeholder="empty = orchestrator model"
+                placeholder={DEFAULT_CHAT_SETTINGS.cloudReaderModel}
                 className={inputClass}
               />
               <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-                Bulk-reads page text for extract/harvest steps. Any cheap text model works (e.g.
-                google/gemini-3.1-flash-lite-20260507). Click grounding uses the navigator model.
+                Bulk-reads page text for extract/harvest steps — the default works well; any cheap text model can be
+                substituted. Click grounding uses the navigator model.
               </p>
             </div>
 
