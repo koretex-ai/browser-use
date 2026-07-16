@@ -156,6 +156,11 @@ const PUNCTUATION_KEYCODES: Record<string, number> = {
 };
 
 function keySpecFor(rawKey: string): KeySpec {
+  // A literal ' ' must resolve to the real Space key (VK 32) — routing it
+  // through the punctuation fallback gave it keyCode 0, which Google Docs'
+  // JS keyboard pipeline choked on: one keycode-0 space and every later
+  // character was dropped (live T3 run 2026-07-16: 7 lines in, "5" out)
+  if (rawKey === ' ') return NAMED_KEYS.space;
   const named = NAMED_KEYS[rawKey.toLowerCase()];
   if (named) return named;
   if (rawKey.length === 1) {
@@ -229,6 +234,15 @@ const CHAR_MS = 5; // between ordinary characters
 /** One printable character as a real keydown/keyup pair. */
 async function cdpChar(tabId: number, ch: string): Promise<void> {
   const spec = keySpecFor(ch);
+  if (!spec.keyCode) {
+    // No real virtual keycode exists for this character (en/em dashes,
+    // other unicode). A fabricated keyDown with keyCode 0 can break
+    // JS-keyboard editors like Docs, while insertText lands cleanly in any
+    // focused editor (and in Sheets the cell editor is already open by the
+    // time a mid-word character arrives).
+    await send(tabId, 'Input.insertText', { text: ch });
+    return;
+  }
   await send(tabId, 'Input.dispatchKeyEvent', {
     type: 'keyDown',
     key: spec.key,
