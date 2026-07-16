@@ -129,6 +129,9 @@ Plainly, so there is no ambiguity about the current architecture:
 - **What stays local** (via Ollama): click grounding — resolving element descriptions to screen coordinates — and bulk page-text reading, so full pages never round-trip through the cloud; only the screenshot plus a compact digest (URL, title, element labels, a text sample) is sent.
 - **Teaching** captures no screenshots in the saved skill; password fields are masked at the moment of capture; you review everything before saving. The demonstration log is sent to the cloud once, for distilling, under the same no-retention routing.
 - **No credentials, ever.** The agent never logs in or handles passwords — if a login wall appears, it stops and tells you.
+- **Cloud-only mode** (optional): for users who can't run local models, everything can run through a single API key — page reading and click grounding move to cloud models, which means full page text also leaves the machine. Two protections are built in for this mode:
+  - **PII guard (on by default)**: detectable identifiers — emails, phone numbers, card numbers, SSNs — are replaced with tokens *before* any text leaves; the real values stay in a local vault and are substituted back on your machine at the moment the agent types them. The cloud reasons over placeholders yet the task completes with real data. (Honest scope: this covers pattern-detectable identifiers in text — not names in ordinary page content, and not screenshots.)
+  - **Sensitive sites ask first**: on banking, health, government, or any site you list, the agent pauses and asks for your explicit go-ahead before working there — because no filter makes a bank dashboard safe to photograph.
 - A fully local mode (no API key) remains: nothing leaves the machine, at significantly reduced capability.
 
 ## Status

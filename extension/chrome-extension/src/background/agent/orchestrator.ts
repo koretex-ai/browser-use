@@ -1,6 +1,7 @@
 import { chatSettingsStore } from '@extension/storage';
 import { createLogger } from '../log';
 import { fetchWithTimeout, withTimeout } from '../net';
+import { scrubPii } from './pii';
 
 const logger = createLogger('orchestrator');
 
@@ -521,15 +522,22 @@ function isTransientNetworkError(error: unknown): boolean {
   return /failed to fetch|network|timed out|ECONNRESET|socket|HTTP 5\d\d|HTTP 429/i.test(message);
 }
 
-async function callOrchestrator<T>(
+export async function callOrchestrator<T>(
   systemPrompt: string,
   userContent: string,
   signal: AbortSignal,
   onProgress?: ProgressFn,
   opts?: CallOpts,
 ): Promise<{ value: T; usage: CallUsage }> {
-  const { orchestratorBaseUrl, orchestratorApiKey, orchestratorModel } = await chatSettingsStore.getSettings();
+  const { orchestratorBaseUrl, orchestratorApiKey, orchestratorModel, cloudOnly, piiGuard } =
+    await chatSettingsStore.getSettings();
   const model = opts?.modelOverride || orchestratorModel;
+
+  // PII guard (cloud-only mode): every text payload passes through the
+  // pseudonymizer at this single choke point — detectable identifiers leave
+  // as vault tokens, and the executor substitutes real values back locally
+  // at typing time. Screenshots are not covered by this layer.
+  if (cloudOnly && piiGuard) userContent = scrubPii(userContent);
 
   // Per-step navigator turns must be snappy — a shorter window plus the
   // image-free fallback beats waiting out two 90s stalls

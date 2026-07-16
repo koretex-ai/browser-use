@@ -26,6 +26,10 @@ export interface RunState {
   status: RunStatus;
   /** Questions posted to the user; their next message answers these */
   pendingQuestions?: string[];
+  /** Sensitive sites the user approved for this task */
+  approvedHosts?: string[];
+  /** Host awaiting the user's go-ahead — approved when the run is resumed */
+  pendingApprovalHost?: string;
   plansUsed: number;
   updatedAt: number;
 }

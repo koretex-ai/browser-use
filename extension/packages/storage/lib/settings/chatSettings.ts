@@ -25,6 +25,27 @@ export interface ChatSettingsConfig {
    * orchestrator requests no-data-retention routing, but it is still remote.
    */
   navigatorModel: string;
+  /**
+   * Cloud-only mode: run the reader and grounder via the orchestrator
+   * endpoint too — no Ollama or local models required. Full page text then
+   * leaves the machine for extract/harvest steps (same no-retention routing).
+   */
+  cloudOnly: boolean;
+  /** Text model for cloud page reading; empty = orchestratorModel */
+  cloudReaderModel: string;
+  /**
+   * PII guard (cloud-only mode): detectable identifiers (emails, phone
+   * numbers, card numbers, SSNs) in outgoing TEXT are replaced with stable
+   * tokens; the real values stay in a local vault and are substituted back
+   * at typing time. Screenshots are not covered by this layer.
+   */
+  piiGuard: boolean;
+  /**
+   * Comma-separated host/path fragments that require the user's explicit
+   * go-ahead before the agent works there (screenshots of such pages would
+   * go to the cloud model).
+   */
+  sensitiveSites: string;
 }
 
 export type ChatSettingsStorage = BaseStorage<ChatSettingsConfig> & {
@@ -48,6 +69,10 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettingsConfig = {
   // agent model on OpenRouter ($0.14/$0.28 per 1M, 310B-A15B omni MoE,
   // GUI-agent-trained). Alternates: qwen/qwen3.5-122b-a10b, z-ai/glm-4.6v.
   navigatorModel: 'xiaomi/mimo-v2.5',
+  cloudOnly: false,
+  cloudReaderModel: '',
+  piiGuard: true,
+  sensitiveSites: 'bank, banking, paypal, venmo, wise.com, health, medical, clinic, insurance, medicare, centrelink, .gov, ato., irs.',
 };
 
 const storage = createStorage<ChatSettingsConfig>('chat-settings', DEFAULT_CHAT_SETTINGS, {

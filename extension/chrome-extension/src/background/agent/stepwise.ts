@@ -1,5 +1,6 @@
 import type { PerceptionSnapshot, TaskRecord, RunStatus } from '@extension/storage';
-import { Actors, trajectoryStore, runStateStore, skillStore } from '@extension/storage';
+import { Actors, trajectoryStore, runStateStore, skillStore, chatSettingsStore } from '@extension/storage';
+import { resetPiiVault, rehydratePii } from './pii';
 import { createLogger } from '../log';
 import { postExecutionEvent } from '../events';
 import { capturePageState } from '../perception';
@@ -212,6 +213,17 @@ export async function runStepwiseTask(
   let stepsUsed = 0;
   let rejections = 0;
 
+  // Cloud-only mode + PII guard + sensitive-site policy, loaded once per run
+  const runSettings = await chatSettingsStore.getSettings();
+  const piiGuardActive = runSettings.cloudOnly && runSettings.piiGuard;
+  resetPiiVault();
+  const sensitivePatterns = (runSettings.sensitiveSites ?? '')
+    .split(',')
+    .map(pattern => pattern.trim().toLowerCase())
+    .filter(Boolean);
+  const approvedHosts = new Set<string>();
+  let pendingApprovalHost: string | undefined;
+
   const persist = async (status: RunStatus) => {
     try {
       await runStateStore.setRun({
@@ -221,6 +233,8 @@ export async function runStepwiseTask(
         collection: collection.slice(),
         status,
         pendingQuestions,
+        approvedHosts: [...approvedHosts],
+        pendingApprovalHost,
         // Schema reuse: the runstate field is named for the PAV engine, but it
         // is just "budget consumed so far" — stepwise stores steps here
         plansUsed: stepsUsed,
@@ -244,6 +258,9 @@ export async function runStepwiseTask(
       logger.warning('report call failed:', error);
       answer = `${reason}\n\nWhat happened:\n${journal.slice(-12).join('\n')}`;
     }
+    // Vault tokens in the answer become real values HERE, locally — the user
+    // sees their actual data even though the cloud only saw placeholders
+    answer = rehydratePii(answer);
     if (status === 'achieved') {
       await runStateStore.clearRun(taskId).catch(() => {});
       finishOk(answer, meta);
@@ -296,6 +313,12 @@ export async function runStepwiseTask(
           collection.push(item);
         }
       }
+      for (const host of prior.approvedHosts ?? []) approvedHosts.add(host);
+      // Resuming a run that stalled on a sensitive-site ask IS the approval
+      if (prior.pendingApprovalHost) {
+        approvedHosts.add(prior.pendingApprovalHost);
+        note(`user approved working on the sensitive site ${prior.pendingApprovalHost}`);
+      }
     };
     if (prior.status === 'awaiting_clarification') {
       seedFromPrior();
@@ -322,6 +345,12 @@ export async function runStepwiseTask(
 
   record.mode = 'plan';
 
+  if (piiGuardActive) {
+    note(
+      'PII guard active: values like ⟨email-1⟩ or ⟨phone-1⟩ are REAL values masked locally — use the tokens verbatim; typing a token types the real value.',
+    );
+  }
+
   const runner = createStepRunner(
     tabId,
     taskId,
@@ -330,6 +359,18 @@ export async function runStepwiseTask(
       onExtract: recordExtract,
       knownData: () => collection.slice(-8).map(entry => entry.slice(0, 250)),
       collectedItems: () => collection,
+      // Cloud-only mode: extract/harvest read via the orchestrator endpoint
+      readerEndpoint: runSettings.cloudOnly
+        ? {
+            kind: 'cloud',
+            baseUrl: runSettings.orchestratorBaseUrl,
+            apiKey: runSettings.orchestratorApiKey,
+            model: runSettings.cloudReaderModel || runSettings.orchestratorModel,
+            tier: 0,
+          }
+        : undefined,
+      scrubForCloud: piiGuardActive,
+      onUsage: usage => track(usage),
     },
     signal,
   );
@@ -501,6 +542,30 @@ export async function runStepwiseTask(
         heartbeat('Looking at the result and deciding the next step…');
       }
       const observed = await observe();
+
+      // ---- SENSITIVE-SITE POLICY: ask before working where it matters ----
+      // Screenshots of this page would go to the cloud model; on a site from
+      // the user's sensitive list, that needs their explicit go-ahead once
+      // per task. Resuming IS the approval.
+      const sensitiveHit = sensitivePatterns.find(pattern => currentUrlPath.toLowerCase().includes(pattern));
+      const currentHost = currentUrlPath.split('/')[0];
+      if (sensitiveHit && currentHost && !approvedHosts.has(currentHost)) {
+        pendingApprovalHost = currentHost;
+        note(`paused on ${currentHost} — matches the sensitive-site list ("${sensitiveHit}"), awaiting user approval`);
+        record.outcome = 'ok';
+        record.answer = `sensitive-site approval requested: ${currentHost}`;
+        await persist('stalled');
+        postExecutionEvent(
+          port,
+          Actors.ASSISTANT,
+          'task.ok',
+          taskId,
+          `⚠️ This task is on **${currentHost}**, which matches your sensitive-site list ("${sensitiveHit}"). Continuing will send screenshots of this page to the cloud model (no-retention routing, but they do leave your machine).\n\nReply "continue" to proceed — that approves ${currentHost} for this task — or give me a different task to stop here.`,
+        );
+        outcome = 'ok';
+        outcomeSummary = 'awaiting sensitive-site approval';
+        return;
+      }
 
       // Surface playbook activation in the trace + journal whenever the set
       // changes — the trigger is deterministic (host/path substring or

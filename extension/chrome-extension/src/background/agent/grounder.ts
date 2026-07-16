@@ -1,6 +1,7 @@
 import { chatSettingsStore } from '@extension/storage';
 import { createLogger } from '../log';
 import { fetchWithTimeout } from '../net';
+import { callOrchestrator } from './orchestrator';
 import { captureScreenshot, runInPage, GROUNDER_SCREENSHOT_OPTS } from '../perception';
 import { getViewportSize } from '../perception/pageScript';
 
@@ -46,9 +47,34 @@ export interface GroundedPoint {
  * ~5s/call (image-prefill bound) — use only when DOM grounding can't.
  */
 export async function groundTarget(tabId: number, instruction: string, signal: AbortSignal): Promise<GroundedPoint> {
-  const { baseUrl, grounderModel } = await chatSettingsStore.getSettings();
+  const { baseUrl, grounderModel, cloudOnly, navigatorModel } = await chatSettingsStore.getSettings();
   const shot = await captureScreenshot(tabId, GROUNDER_SCREENSHOT_OPTS);
   const base64 = shot.dataUrl.replace(/^data:[^,]+,/, '');
+
+  // Cloud-only mode: the navigator model is GUI-agent-trained — it grounds
+  // coordinates from the same screenshots it already judges from
+  if (cloudOnly) {
+    const { value, usage } = await callOrchestrator<{ x: number; y: number }>(
+      'You are a web UI grounding model. Reply ONLY with JSON {"x": <int>, "y": <int>} — the pixel coordinates of the single point to click.',
+      groundingPrompt(shot.width, shot.height, instruction),
+      signal,
+      undefined,
+      { imageDataUrl: shot.dataUrl, modelOverride: navigatorModel || undefined, lowLatency: true },
+    );
+    logger.info(`cloud grounding (${usage.model}): x=${value.x} y=${value.y} $${usage.cost ?? '?'}`);
+    let point = { x: Number(value.x), y: Number(value.y) };
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y))
+      throw new Error('Cloud grounder returned no coordinates');
+    if (point.x > shot.width || point.y > shot.height) {
+      point = { x: (point.x / 1000) * shot.width, y: (point.y / 1000) * shot.height };
+    }
+    const viewport = await runInPage(tabId, getViewportSize);
+    return {
+      x: Math.round(point.x * (viewport.width / shot.width)),
+      y: Math.round(point.y * (viewport.height / shot.height)),
+      target: instruction,
+    };
+  }
 
   const response = await fetchWithTimeout(
     `${baseUrl}/api/chat`,
@@ -106,10 +132,23 @@ export async function groundTarget(tabId: number, instruction: string, signal: A
  * the machine; only the text verdict reaches the cloud orchestrator.
  */
 export async function verifyVisual(tabId: number, question: string, signal: AbortSignal): Promise<string> {
-  const { baseUrl, verifierModel, grounderModel } = await chatSettingsStore.getSettings();
+  const { baseUrl, verifierModel, grounderModel, cloudOnly, navigatorModel } = await chatSettingsStore.getSettings();
   const model = verifierModel || grounderModel;
   const shot = await captureScreenshot(tabId, GROUNDER_SCREENSHOT_OPTS);
   const base64 = shot.dataUrl.replace(/^data:[^,]+,/, '');
+
+  if (cloudOnly) {
+    const { value } = await callOrchestrator<{ answer: string }>(
+      'You answer a question about a screenshot of a web page. If the question asks whether something is visible/present, start with YES or NO, then quote the relevant visible text. Reply ONLY with JSON {"answer": "<concise answer>"}.',
+      `QUESTION: ${question}`,
+      signal,
+      undefined,
+      { imageDataUrl: shot.dataUrl, modelOverride: navigatorModel || undefined, lowLatency: true },
+    );
+    const answer = (value.answer ?? '').trim();
+    logger.info('cloud visual verify:', question.slice(0, 80), '->', answer.slice(0, 160));
+    return answer;
+  }
 
   const response = await fetchWithTimeout(
     `${baseUrl}/api/chat`,

@@ -4,6 +4,9 @@ import { createLogger } from '../log';
 import { capturePageState, capturePageText } from '../perception';
 import { executeAction } from '../actions/executor';
 import { extractFromPage, LOCAL_ENDPOINT } from './planner';
+import type { PlannerEndpoint } from './planner';
+import type { CallUsage } from './orchestrator';
+import { scrubPii, rehydratePii } from './pii';
 import { groundTarget, verifyVisual } from './grounder';
 import type { ProgramStep } from './orchestrator';
 
@@ -38,6 +41,16 @@ export interface StepRunnerContext {
    * data reaches the page verbatim without a cloud round-trip.
    */
   collectedItems?: () => string[];
+  /**
+   * Where extract/harvest reading runs. Default local (Ollama). Cloud-only
+   * mode passes a cloud endpoint — page text then leaves the machine, so it
+   * is scrubbed by the PII guard first when scrubForCloud is set.
+   */
+  readerEndpoint?: PlannerEndpoint;
+  /** Pseudonymize page text before a CLOUD reader call (PII guard active) */
+  scrubForCloud?: boolean;
+  /** Cost attribution for cloud reader calls */
+  onUsage?: (usage: CallUsage) => void;
 }
 
 export interface StepRunner {
@@ -231,8 +244,13 @@ export function createStepRunner(
   // re-reports items that stay in view across scrolls, so only never-seen
   // lines count toward the target — and only they reach the journal.
   const runExtract = async (query: string, seen?: Set<string>): Promise<{ newItems: number; note: string }> => {
-    const pageText = await capturePageText(tabId).catch(() => lastState?.pageText ?? '');
-    const { answer } = await extractFromPage(query, pageText, signal, LOCAL_ENDPOINT, ctx.knownData?.() ?? []);
+    let pageText = await capturePageText(tabId).catch(() => lastState?.pageText ?? '');
+    const endpoint = ctx.readerEndpoint ?? LOCAL_ENDPOINT;
+    // Cloud reading sends the FULL page text off-machine — pseudonymize
+    // detectable identifiers first when the PII guard is on
+    if (endpoint.kind === 'cloud' && ctx.scrubForCloud) pageText = scrubPii(pageText);
+    const { answer, usage } = await extractFromPage(query, pageText, signal, endpoint, ctx.knownData?.() ?? []);
+    if (usage) ctx.onUsage?.(usage);
     if (/^NOTHING NEW/i.test(answer)) return { newItems: 0, note: 'nothing new' };
     if (answer.startsWith('NOT FOUND')) return { newItems: 0, note: answer.slice(0, 120) };
     let reported = answer;
@@ -277,12 +295,15 @@ export function createStepRunner(
   // collection store — the full untruncated items, joined below any literal
   // text (which serves as a header line)
   const resolveStepText = (step: ProgramStep): string | undefined => {
+    // rehydratePii: vault tokens (⟨email-1⟩…) become their real values at the
+    // moment of TYPING — the substitution happens locally, so the cloud only
+    // ever saw the token. No-op when the vault is empty.
     if (step.textFrom === 'collected') {
       const items = ctx.collectedItems?.() ?? [];
       if (items.length === 0) return undefined;
-      return normalizeTabs([step.text, ...items].filter(Boolean).join('\n'));
+      return rehydratePii(normalizeTabs([step.text, ...items].filter(Boolean).join('\n')));
     }
-    return step.text === undefined ? undefined : normalizeTabs(step.text);
+    return step.text === undefined ? undefined : rehydratePii(normalizeTabs(step.text));
   };
 
   const execStep = async (step: ProgramStep): Promise<{ ok: boolean; message: string }> => {

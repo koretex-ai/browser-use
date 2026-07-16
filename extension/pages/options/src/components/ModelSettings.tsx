@@ -20,6 +20,10 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
   const [orchestratorApiKey, setOrchestratorApiKey] = useState(DEFAULT_CHAT_SETTINGS.orchestratorApiKey);
   const [orchestratorModel, setOrchestratorModel] = useState(DEFAULT_CHAT_SETTINGS.orchestratorModel);
   const [navigatorModel, setNavigatorModel] = useState(DEFAULT_CHAT_SETTINGS.navigatorModel);
+  const [cloudOnly, setCloudOnly] = useState(DEFAULT_CHAT_SETTINGS.cloudOnly);
+  const [cloudReaderModel, setCloudReaderModel] = useState(DEFAULT_CHAT_SETTINGS.cloudReaderModel);
+  const [piiGuard, setPiiGuard] = useState(DEFAULT_CHAT_SETTINGS.piiGuard);
+  const [sensitiveSites, setSensitiveSites] = useState(DEFAULT_CHAT_SETTINGS.sensitiveSites);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [connection, setConnection] = useState<ConnectionStatus>({ state: 'idle' });
   const [saved, setSaved] = useState(false);
@@ -34,6 +38,10 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
       setOrchestratorApiKey(settings.orchestratorApiKey);
       setOrchestratorModel(settings.orchestratorModel);
       setNavigatorModel(settings.navigatorModel);
+      setCloudOnly(settings.cloudOnly);
+      setCloudReaderModel(settings.cloudReaderModel);
+      setPiiGuard(settings.piiGuard);
+      setSensitiveSites(settings.sensitiveSites);
     });
   }, []);
 
@@ -67,6 +75,10 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
       orchestratorApiKey: orchestratorApiKey.trim(),
       orchestratorModel: orchestratorModel.trim(),
       navigatorModel: navigatorModel.trim(),
+      cloudOnly,
+      cloudReaderModel: cloudReaderModel.trim(),
+      piiGuard,
+      sensitiveSites: sensitiveSites.trim(),
     });
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
@@ -310,6 +322,85 @@ export const ModelSettings = ({ isDarkMode = false }: ModelSettingsProps) => {
             </p>
           </div>
 
+        </div>
+      </div>
+
+      <div className={`border-t pt-6 ${isDarkMode ? 'border-[#1F7A4A]/40' : 'border-gray-200'}`}>
+        <div className="mb-1 flex items-center justify-between">
+          <h2 className={`text-lg font-semibold ${isDarkMode ? 'text-gray-200' : 'text-gray-800'}`}>
+            Cloud-only mode (no local models)
+          </h2>
+          <label className="flex cursor-pointer items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={cloudOnly}
+              onChange={e => setCloudOnly(e.target.checked)}
+              className="size-4 accent-[#2BE87D]"
+            />
+            <span className={isDarkMode ? 'text-gray-300' : 'text-gray-700'}>Enabled</span>
+          </label>
+        </div>
+        <p className={`mb-4 text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+          Run everything through the cloud endpoint above — no Ollama required. Page reading and click grounding move
+          to cloud models, which means full page text also leaves your machine (same no-retention routing). The local
+          model settings above are ignored while this is on.
+        </p>
+
+        {cloudOnly && (
+          <div className="space-y-4">
+            <div>
+              <label htmlFor="cloud-reader" className={labelClass}>
+                Cloud reader model
+              </label>
+              <input
+                id="cloud-reader"
+                type="text"
+                value={cloudReaderModel}
+                onChange={e => setCloudReaderModel(e.target.value)}
+                placeholder="empty = orchestrator model"
+                className={inputClass}
+              />
+              <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                Bulk-reads page text for extract/harvest steps. Any cheap text model works (e.g.
+                google/gemini-3.1-flash-lite-20260507). Click grounding uses the navigator model.
+              </p>
+            </div>
+
+            <div>
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={piiGuard}
+                  onChange={e => setPiiGuard(e.target.checked)}
+                  className="size-4 accent-[#2BE87D]"
+                />
+                <span className={isDarkMode ? 'text-gray-300' : 'text-gray-700'}>PII guard (recommended)</span>
+              </label>
+              <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                Emails, phone numbers, card numbers and SSNs in outgoing text are replaced with tokens before leaving
+                your machine; the real values are substituted back locally when the agent types them. Does not cover
+                screenshots or names in ordinary page content.
+              </p>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-4">
+          <label htmlFor="sensitive-sites" className={labelClass}>
+            Sensitive sites (ask before working there)
+          </label>
+          <input
+            id="sensitive-sites"
+            type="text"
+            value={sensitiveSites}
+            onChange={e => setSensitiveSites(e.target.value)}
+            placeholder={DEFAULT_CHAT_SETTINGS.sensitiveSites}
+            className={inputClass}
+          />
+          <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+            Comma-separated URL fragments. On a matching site the agent pauses and asks before continuing, because
+            screenshots of it would go to the cloud model.
+          </p>
         </div>
       </div>
 
