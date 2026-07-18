@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { FiSettings, FiClock } from 'react-icons/fi';
-import { PiPlusBold, PiGraduationCapBold } from 'react-icons/pi';
+import { PiPlusBold, PiGraduationCapBold, PiBugBold } from 'react-icons/pi';
 import { GrHistory } from 'react-icons/gr';
 import { type Message, Actors, chatHistoryStore, trajectoryStore } from '@extension/storage';
 import favoritesStorage, { type FavoritePrompt } from '@extension/storage/lib/prompt/favorites';
@@ -10,6 +10,7 @@ import ChatInput from './components/ChatInput';
 import ChatHistoryList from './components/ChatHistoryList';
 import BookmarkList from './components/BookmarkList';
 import ScheduleList from './components/ScheduleList';
+import ReportDialog from './components/ReportDialog';
 import { EventType, type AgentEvent, ExecutionState } from './types/event';
 import './SidePanel.css';
 
@@ -41,6 +42,8 @@ const SidePanel = () => {
   const [teachPhase, setTeachPhase] = useState<null | 'recording' | 'distilling' | 'reviewing'>(null);
   // A task just succeeded — offer to distill the run into a skill
   const [skillOffer, setSkillOffer] = useState(false);
+  // Bug-report dialog for the current session (user-initiated only)
+  const [showReport, setShowReport] = useState(false);
   const sessionIdRef = useRef<string | null>(null);
   const portRef = useRef<chrome.runtime.Port | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
@@ -780,7 +783,10 @@ const SidePanel = () => {
 
   return (
     <div>
-      <div className="flex h-screen flex-col overflow-hidden rounded-2xl border border-[#3D3D3D]/40 bg-[#000000]">
+      <div className="relative flex h-screen flex-col overflow-hidden rounded-2xl border border-[#3D3D3D]/40 bg-[#000000]">
+        {showReport && currentSessionId && (
+          <ReportDialog sessionId={currentSessionId} onClose={() => setShowReport(false)} />
+        )}
         <header className="header relative">
           <div className="header-logo">
             {showHistory || showSchedules ? (
@@ -827,6 +833,18 @@ const SidePanel = () => {
                   tabIndex={0}>
                   <FiClock size={20} />
                 </button>
+                {currentSessionId && (
+                  <button
+                    type="button"
+                    onClick={() => setShowReport(true)}
+                    onKeyDown={e => e.key === 'Enter' && setShowReport(true)}
+                    className="header-icon cursor-pointer text-[#E8E8E8] hover:text-[#FFFFFF]"
+                    aria-label="Report a problem with this task"
+                    title="Report a problem: send this task's trace to the Koretex team"
+                    tabIndex={0}>
+                    <PiBugBold size={20} />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={handleLoadHistory}

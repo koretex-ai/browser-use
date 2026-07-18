@@ -6,8 +6,8 @@ Local Browser Use is a Chrome extension that acts as an AI browsing agent: you g
 
 ## The short version
 
-- The extension has **no server of its own**. There is no account, no sign-up, and no analytics or tracking of any kind.
-- Data leaves your machine **only** to the AI model provider **you configure** (e.g. OpenRouter, or a local Ollama instance), and only as needed to perform the task you asked for.
+- The extension has **no account, no sign-up, and no analytics or tracking of any kind**. Its only server-side component is a tiny relay used solely for bug reports **you** choose to send (see "Bug reports" below).
+- Beyond that, data leaves your machine **only** to the AI model provider **you configure** (e.g. OpenRouter, or a local Ollama instance), and only as needed to perform the task you asked for.
 - Your API key, chat history, settings, and collected data are stored locally in your browser's extension storage. **We never see any of it.**
 - We do not sell, share, or monetize any data. There are no third parties beyond the model provider you choose.
 
@@ -30,6 +30,10 @@ The extension supports different engines and modes; what leaves your machine dep
 - **Settings and site playbooks (skills)** — stored locally; exported only if you use the Export button yourself.
 - **The PII vault** — the token-to-real-value mapping used by the PII guard; per-task, in memory, never transmitted.
 - **Credentials** — the agent never fills in, reads, or handles logins, passwords, or payment fields. If a task requires being signed in, you sign in yourself; if a login wall appears mid-task, the run stops and tells you.
+
+## Bug reports (only when you press Send)
+
+The side panel has a "Report a problem" button. Pressing it prepares a **text-only** bundle of that task — the trace you already see in the panel, the run journal, and settings metadata (model names, mode flags, extension version). It **never** includes screenshots, your API key, or the PII vault. Nothing is transmitted until you review the bundle in the dialog and press **Send**; you can equally download the file and share it yourself, or not at all. Sent reports go to a relay we operate and are delivered to a private channel the Koretex team uses for triage. Because the trace can quote content from pages the agent worked on, review it before sending — reports are treated as confidential and used only to fix the problem you reported.
 
 ## Permissions
 

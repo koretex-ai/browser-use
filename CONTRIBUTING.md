@@ -6,7 +6,9 @@ Thanks for your interest in making Browser Use better! Contributions of every ki
 
 ### 🐛 Report a bug
 
-Open an issue and include:
+**Easiest way (alpha testers):** click the 🐞 button in the side panel header — it packages the run's trace into a text-only bundle you can review and send to the team directly (or download and share on [Discord](https://discord.gg/4xtjpKf5p)).
+
+Otherwise, open an issue and include:
 
 - What you asked the agent to do (the task you typed)
 - What happened vs. what you expected
