@@ -2,6 +2,8 @@
 
 **A browser agent that sees, judges, and learns how *you* do things.**
 
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/4xtjpKf5p) [![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen)](CONTRIBUTING.md)
+
 Browser Use is a Chrome extension. You type a task into its side panel in plain language — *"find 5 second-degree decision makers in Melbourne on LinkedIn and copy their details into a Google Sheet"* — and it drives your real, logged-in browser to deliver it: navigating, clicking, typing, reading, and checking its own work from screenshots at every step.
 
 It is built around three ideas:
@@ -137,3 +139,15 @@ Plainly, so there is no ambiguity about the current architecture:
 ## Status
 
 Research prototype under active development. The three-task benchmark (structured data collection into a spreadsheet, irreversible social posting with cleanup, content research into a document) has been delivered end-to-end. On the roadmap: semantic skill retrieval as libraries grow, multi-site workflow skills, voice narration for teaching, and skill sharing beyond JSON files.
+
+## Contributing & community
+
+Contributions are very welcome — this project gets better with more eyes on real runs.
+
+- **Found a bug or have an idea?** [Open an issue](../../issues) — trace excerpts make bug reports gold.
+- **Want to improve something?** Fork, branch, and [raise a PR](../../pulls). Small fixes can go straight to a PR; for bigger changes, an issue first helps align on the design.
+- **Taught the agent a great skill?** Skills export as plain JSON — share them!
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the details.
+
+**💬 Join our [Discord](https://discord.gg/4xtjpKf5p)** to ask questions, share what you've built, or follow development.
