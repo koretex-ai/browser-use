@@ -75,5 +75,12 @@ export async function acquireTaskTab(sessionId: string): Promise<TaskTabAcquisit
   if (win?.id === undefined || tabId === undefined) return null;
   agentWindowId = win.id;
   sessionTabs.set(sessionId, { windowId: win.id, tabId });
+  // Open the side panel IN the agent window so the trace is watchable right
+  // next to the pages being driven (execution events broadcast to every
+  // connected panel). Chrome may refuse without a user gesture — then the
+  // user can open it themselves from the extension icon; not fatal.
+  await chrome.sidePanel
+    .open({ windowId: win.id })
+    .catch(error => logger.info('side panel not opened in agent window (no user gesture):', String(error)));
   return { tabId, created: 'window' };
 }

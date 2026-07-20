@@ -17,6 +17,32 @@ let currentPort: chrome.runtime.Port | null = null;
 let currentAbort: AbortController | null = null;
 let teachAbort: AbortController | null = null;
 
+// Every connected side panel — the agent window's own panel included. Agent
+// task events BROADCAST to all of them so the trace is watchable next to the
+// pages being driven (user feedback 2026-07-20: trace only showed in the
+// window the task was typed in). Only the ORIGINATING panel has the session
+// loaded, so only it persists messages to chat history — a fresh panel in
+// the agent window displays live events without double-writing them.
+const connectedPorts = new Set<chrome.runtime.Port>();
+const broadcastPort = (origin: chrome.runtime.Port): chrome.runtime.Port =>
+  ({
+    postMessage: (message: unknown) => {
+      let delivered = false;
+      for (const port of connectedPorts) {
+        try {
+          port.postMessage(message);
+          delivered = true;
+        } catch {
+          /* that panel is gone — the disconnect listener prunes it */
+        }
+      }
+      // Every panel closed: fall back to the origin port's own error path
+      if (!delivered) origin.postMessage(message);
+    },
+  }) as chrome.runtime.Port;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Setup side panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(error => console.error(error));
 
@@ -39,6 +65,7 @@ chrome.runtime.onConnect.addListener(port => {
   }
 
   currentPort = port;
+  connectedPorts.add(port);
 
   port.onMessage.addListener(async message => {
     try {
@@ -63,27 +90,26 @@ chrome.runtime.onConnect.addListener(port => {
               // Agent mode runs in the DEDICATED agent window, never in the
               // tab the user is browsing (user decision 2026-07-20). Same
               // session reuses its tab so "continue" sees the stalled page.
+              // Announce BEFORE opening and give the user a beat to read it
+              // (feedback: the window popped before the message was legible).
+              postExecutionEvent(
+                port,
+                Actors.SYSTEM,
+                'step.ok',
+                message.taskId,
+                '🪟 This task runs in a separate agent window — opening it now. Keep using your current window; the trace also shows in the agent window’s panel.',
+              );
+              await sleep(1200);
               const acquired = await acquireTaskTab(message.taskId);
-              if (acquired?.created === 'window') {
-                postExecutionEvent(
-                  port,
-                  Actors.SYSTEM,
-                  'step.ok',
-                  message.taskId,
-                  '🪟 Opening a separate window to run this task — keep using your current window; progress shows here.',
-                );
-              } else if (acquired?.created === 'tab') {
-                postExecutionEvent(
-                  port,
-                  Actors.SYSTEM,
-                  'step.ok',
-                  message.taskId,
-                  '🪟 Running in the agent window (new tab) — keep using your current window.',
-                );
-              }
               // The loop decides whether the task needs the browser
               // (a 'respond' decision falls back to plain streaming chat)
-              await runAgentTask(port, acquired?.tabId ?? message.tabId, message.taskId, message.task, abort.signal);
+              await runAgentTask(
+                broadcastPort(port),
+                acquired?.tabId ?? message.tabId,
+                message.taskId,
+                message.task,
+                abort.signal,
+              );
             } else {
               await streamChatReply(port, message.taskId, message.task, abort.signal);
             }
@@ -140,11 +166,17 @@ chrome.runtime.onConnect.addListener(port => {
 
   port.onDisconnect.addListener(() => {
     console.log('Side panel disconnected');
+    connectedPorts.delete(port);
     if (currentPort === port) {
       currentPort = null;
     }
-    currentAbort?.abort();
-    teachAbort?.abort();
-    teachAbort = null;
+    // Only kill the running task when NO panel remains — closing the agent
+    // window's viewer panel (or the originating one) must not abort a run
+    // the user is still watching elsewhere
+    if (connectedPorts.size === 0) {
+      currentAbort?.abort();
+      teachAbort?.abort();
+      teachAbort = null;
+    }
   });
 });
