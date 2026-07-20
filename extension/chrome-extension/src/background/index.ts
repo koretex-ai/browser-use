@@ -7,7 +7,7 @@ import { handleTeachMessage } from './recorder/teach';
 import { initSchedules, setUserTaskProbe, cancelScheduledRun } from './schedules';
 import { acquireTaskTab } from './taskWindow';
 import { postExecutionEvent } from './events';
-import { Actors } from '@extension/storage';
+import { Actors, chatHistoryStore } from '@extension/storage';
 
 const logger = createLogger('background');
 
@@ -16,6 +16,9 @@ const SIDE_PANEL_URL = chrome.runtime.getURL('side-panel/index.html');
 let currentPort: chrome.runtime.Port | null = null;
 let currentAbort: AbortController | null = null;
 let teachAbort: AbortController | null = null;
+// Session of the task in flight — lets a panel that connects MID-RUN (the
+// trace viewer) backfill the transcript so far from chat history
+let currentTaskSessionId: string | null = null;
 
 // Every connected side panel — the agent window's own panel included. Agent
 // task events BROADCAST to all of them so the trace is watchable next to the
@@ -67,6 +70,20 @@ chrome.runtime.onConnect.addListener(port => {
   currentPort = port;
   connectedPorts.add(port);
 
+  // A task is already running: seed this panel with the transcript so far
+  // (the originating panel persists every message as it happens)
+  if (currentAbort && currentTaskSessionId) {
+    const sessionId = currentTaskSessionId;
+    chatHistoryStore
+      .getSession(sessionId)
+      .then(session => {
+        if (session?.messages?.length) {
+          port.postMessage({ type: 'session_backfill', messages: session.messages });
+        }
+      })
+      .catch(error => logger.warning('session backfill failed:', error));
+  }
+
   port.onMessage.addListener(async message => {
     try {
       switch (message.type) {
@@ -85,6 +102,7 @@ chrome.runtime.onConnect.addListener(port => {
           cancelScheduledRun();
           const abort = new AbortController();
           currentAbort = abort;
+          currentTaskSessionId = message.taskId;
           try {
             if (message.tabId) {
               // Agent mode runs in the DEDICATED agent window, never in the
@@ -114,7 +132,10 @@ chrome.runtime.onConnect.addListener(port => {
               await streamChatReply(port, message.taskId, message.task, abort.signal);
             }
           } finally {
-            if (currentAbort === abort) currentAbort = null;
+            if (currentAbort === abort) {
+              currentAbort = null;
+              currentTaskSessionId = null;
+            }
           }
           break;
         }

@@ -177,6 +177,13 @@ const SidePanel = () => {
             timestamp: Date.now(),
           });
           finishTask();
+        } else if (message && message.type === 'session_backfill') {
+          // A task was already running when this panel connected (e.g. the
+          // trace viewer next to the agent window): seed the transcript so
+          // the trace is visible from the start, not just from "now".
+          // Session id stays null on purpose — the ORIGINATING panel owns
+          // persistence; this panel only displays.
+          setMessages(prev => (prev.length === 0 ? (message.messages ?? []) : prev));
         } else if (message && message.type === 'heartbeat_ack') {
           console.log('Heartbeat acknowledged');
         } else if (message && message.type === 'skillify_offer') {
@@ -692,6 +699,15 @@ const SidePanel = () => {
     };
 
     loadFavorites();
+  }, []);
+
+  // Connect EAGERLY on mount — a panel opened while a task is running (the
+  // trace viewer in the agent window) must receive broadcast events and the
+  // session backfill immediately; the old lazy connect left it blank until
+  // the user typed something (live 2026-07-20).
+  useEffect(() => {
+    if (!portRef.current) setupConnection();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // First-run tour: open automatically until the user has been through it once
