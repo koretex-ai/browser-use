@@ -128,6 +128,24 @@ function stepFaultReason(step: ProgramStep): string | null {
   return null;
 }
 
+// Hand-transcription detector: how many lines of a typed text duplicate
+// items already in the collection store. The navigator only ever sees the
+// collection through the CAPPED journal digest, so a multi-line write it
+// composes by hand can only carry the rows it happened to see — every other
+// collected item is silently dropped (live run 2026-07-19: 13 collected
+// LinkedIn contacts, 9 hand-typed rows reached the sheet). Matching is by
+// dedup-key prefix because the navigator retypes truncated digest lines.
+function transcribedCollectionLines(text: string | undefined, collectionKeys: Set<string>): number {
+  const lines = (text ?? '')
+    .split('\n')
+    .map(itemKey)
+    .filter(key => key.length >= 8);
+  if (lines.length < 3 || collectionKeys.size === 0) return 0;
+  const prefixes = [...collectionKeys].map(key => key.slice(0, 24)).filter(prefix => prefix.length >= 8);
+  return lines.filter(line => prefixes.some(prefix => line.startsWith(prefix) || prefix.startsWith(line.slice(0, 24))))
+    .length;
+}
+
 const stripBullet = (line: string) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim();
 
 const CONTINUATION = /^(continue|resume|keep going|carry on|go on|proceed|finish it|carry on with it)\b/i;
@@ -817,6 +835,29 @@ export async function runStepwiseTask(
           return;
         }
         continue;
+      }
+
+      // Collected data must be WRITTEN via textFrom:"collected" — a
+      // multi-line type step that retypes collected items by hand carries
+      // only the rows visible in the truncated journal and drops the rest
+      if ((step.do === 'type' || step.do === 'type_focused') && step.textFrom !== 'collected') {
+        const transcribed = transcribedCollectionLines(step.text, collectionKeys);
+        if (transcribed >= 2) {
+          rejections++;
+          note(
+            `step rejected: ${transcribed} of the typed line(s) retype collected items from the journal digest — the digest is truncated, so a hand-typed write silently drops the rest of the ${collection.length}-item collection. Re-issue the write with "textFrom":"collected" (put only the header line in "text"); the runtime inserts every collected item verbatim.`,
+          );
+          if (rejections >= MAX_REJECTIONS) {
+            await report(
+              'partial',
+              'The navigator kept hand-typing collected data instead of using textFrom:"collected".',
+            );
+            outcome = 'fail';
+            outcomeSummary = 'hand-typed collection write blocked';
+            return;
+          }
+          continue;
+        }
       }
 
       const fingerprint = actionFingerprint(step);
